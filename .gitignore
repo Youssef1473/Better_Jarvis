@@ -16,3 +16,6 @@ config/config.local.toml
 models/
 *.bin
 *.onnx
+
+# Agent Scratch & Local Skills
+.agents/

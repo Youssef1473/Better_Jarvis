@@ -423,15 +423,28 @@ pub struct ManagedCdpBrowser {
 unsafe impl Send for ManagedCdpBrowser {}
 unsafe impl Sync for ManagedCdpBrowser {}
 
+static CUSTOM_CDP_PROFILES_DIR: tokio::sync::OnceCell<PathBuf> = tokio::sync::OnceCell::const_new();
+
+pub fn set_cdp_profiles_dir(dir: PathBuf) {
+    let _ = CUSTOM_CDP_PROFILES_DIR.set(dir);
+}
+
+pub fn get_cdp_profiles_dir() -> PathBuf {
+    if let Some(p) = CUSTOM_CDP_PROFILES_DIR.get() {
+        p.clone()
+    } else {
+        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\Temp".into());
+        PathBuf::from(local_app_data).join("Better_Jarvis").join("cdp_profiles")
+    }
+}
+
 impl ManagedCdpBrowser {
     /// Spawns an isolated Chromium child process connected strictly over Win32 anonymous pipes.
     pub fn spawn(browser_binary: &Path) -> Result<Self> {
         let pid = std::process::id();
         let nonce = crate::security::policy::generate_crypto_nonce();
-        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\Temp".into());
-        let profile_dir = Path::new(&local_app_data)
-            .join("Better_Jarvis")
-            .join(format!("cdp_profile_{}_{}", pid, nonce));
+        let base_dir = get_cdp_profiles_dir();
+        let profile_dir = base_dir.join(format!("cdp_profile_{}_{}", pid, nonce));
 
         std::fs::create_dir_all(&profile_dir)
             .with_context(|| format!("Failed to create ephemeral profile dir at {:?}", profile_dir))?;

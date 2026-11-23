@@ -57,6 +57,7 @@ HWND                  g_hwnd = nullptr;
 HANDLE                g_job  = nullptr;
 HANDLE                g_daemon_process = nullptr;
 std::atomic<DWORD>    g_daemon_pid{0};
+std::wstring          g_custom_data_dir;
 std::unique_ptr<jarvis::input::HotkeyListener> g_hotkey;
 std::atomic<bool>     g_running{true};
 std::atomic<bool>     g_daemon_ready{false};
@@ -541,6 +542,9 @@ void SpawnDaemonInJob() {
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
     std::wstring cmd = L"\"" + daemon_path.wstring() + L"\" --parent-pid " + std::to_wstring(GetCurrentProcessId());
+    if (!g_custom_data_dir.empty()) {
+        cmd += L" --data-dir \"" + g_custom_data_dir + L"\"";
+    }
 
     if (CreateProcessW(
             nullptr,
@@ -997,7 +1001,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
     CoInitialize(nullptr);
 
     const std::wstring args = lpCmdLine ? lpCmdLine : L"";
-    const bool no_daemon = (args.find(L"--no-daemon") != std::wstring::npos);
+    bool no_daemon = (args.find(L"--no-daemon") != std::wstring::npos);
+
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv) {
+        for (int i = 1; i < argc; ++i) {
+            if (std::wcscmp(argv[i], L"--no-daemon") == 0) {
+                no_daemon = true;
+            } else if (std::wcscmp(argv[i], L"--data-dir") == 0 && i + 1 < argc) {
+                g_custom_data_dir = argv[++i];
+            }
+        }
+        LocalFree(argv);
+    }
 
     if (!no_daemon) {
         SpawnDaemonInJob();

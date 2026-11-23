@@ -127,12 +127,16 @@ struct TelemetryInner {
 
 impl DaemonTelemetry {
     pub fn new() -> Self {
+        Self::with_log_path(None)
+    }
+
+    pub fn with_log_path(custom_path: Option<PathBuf>) -> Self {
         let (log_tx, mut log_rx) = mpsc::unbounded_channel::<TurnTelemetryRecord>();
+        let target_path = custom_path.unwrap_or_else(Self::resolve_log_path);
 
         // Spawn dedicated disk persistence worker off Tokio workers
         std::thread::spawn(move || {
-            let log_path = Self::resolve_log_path();
-            if let Some(parent) = log_path.parent() {
+            if let Some(parent) = target_path.parent() {
                 let _ = create_dir_all(parent);
             }
 
@@ -141,7 +145,7 @@ impl DaemonTelemetry {
                     if let Ok(mut file) = OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .open(&log_path)
+                        .open(&target_path)
                     {
                         let _ = writeln!(file, "{}", line);
                     }

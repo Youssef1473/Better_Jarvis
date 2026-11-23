@@ -7,8 +7,12 @@ Write-Host "[2/2] Building C++ host..." -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path "build/host-cpp/Release" | Out-Null
 
 if (Get-Command cmake -ErrorAction SilentlyContinue) {
-    cmake -B build -S .
+    cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
     cmake --build build --config Release
+    if ($LASTEXITCODE -ne 0) { throw "C++ host build failed" }
+    if (Test-Path "build/host-cpp/jarvis-host.exe") {
+        Copy-Item "build/host-cpp/jarvis-host.exe" -Destination "build/host-cpp/Release/jarvis-host.exe" -Force
+    }
 } elseif (Get-Command g++ -ErrorAction SilentlyContinue) {
     Write-Host "Using MinGW g++ compiler..." -ForegroundColor Yellow
     g++ -std=c++20 -O2 -Wall -Wextra -Werror host-cpp/src/main.cpp host-cpp/src/audio/wasapi_capture.cpp host-cpp/src/audio/aec_processor.cpp host-cpp/src/audio/silero_vad.cpp host-cpp/src/audio/whisper_stt.cpp host-cpp/src/audio/piper_tts.cpp host-cpp/src/input/hotkey_listener.cpp -I host-cpp/include -mwindows -municode -luser32 -lgdi32 -ldwmapi -lshell32 -lavrt -lole32 -luuid -lsapi -ladvapi32 -o build/host-cpp/Release/jarvis-host.exe

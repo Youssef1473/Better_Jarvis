@@ -52,6 +52,53 @@ struct JsonRpcResponse {
     id: Option<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePaths {
+    pub data_dir: Option<PathBuf>,
+    pub db_path: PathBuf,
+    pub profile_path: PathBuf,
+    pub telemetry_log_path: PathBuf,
+    pub cdp_profiles_dir: PathBuf,
+}
+
+impl RuntimePaths {
+    pub fn resolve(custom_data_dir: Option<PathBuf>) -> Self {
+        if let Some(root) = custom_data_dir {
+            Self {
+                data_dir: Some(root.clone()),
+                db_path: root.join("memory").join("jarvis_memory.db"),
+                profile_path: root.join("memory").join("profile.md"),
+                telemetry_log_path: root.join("logs").join("latency_metrics.jsonl"),
+                cdp_profiles_dir: root.join("cdp_profiles"),
+            }
+        } else {
+            let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
+            let app_data = PathBuf::from(local_app_data).join("Better_Jarvis");
+            Self {
+                data_dir: None,
+                db_path: app_data.join("memory").join("jarvis_memory.db"),
+                profile_path: crate::memory::profile_sync::get_default_profile_path(),
+                telemetry_log_path: app_data.join("logs").join("latency_metrics.jsonl"),
+                cdp_profiles_dir: app_data.join("cdp_profiles"),
+            }
+        }
+    }
+
+    pub fn ensure_directories(&self) -> std::io::Result<()> {
+        if let Some(parent) = self.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Some(parent) = self.profile_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Some(parent) = self.telemetry_log_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::create_dir_all(&self.cdp_profiles_dir)?;
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -67,6 +114,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut passed_parent_pid: Option<u32> = None;
     let mut allow_same_user_ipc = false;
+    let mut custom_data_dir: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -74,6 +122,15 @@ async fn main() -> Result<()> {
             "--parent-pid" => {
                 if i + 1 < args.len() {
                     passed_parent_pid = args[i + 1].parse::<u32>().ok();
+                    i += 1;
+                }
+            }
+            "--data-dir" => {
+                if i + 1 < args.len() {
+                    let dir_arg = args[i + 1].trim();
+                    if !dir_arg.is_empty() {
+                        custom_data_dir = Some(PathBuf::from(dir_arg));
+                    }
                     i += 1;
                 }
             }
@@ -125,23 +182,33 @@ async fn main() -> Result<()> {
     let policy = Arc::new(PolicyEngine::new(&config.allowed_directories));
     let confirmation_mgr = ConfirmationManager::new();
 
-    // Initialize Memory Engine (SQLite with WAL mode + profile.md synchronization)
-    let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-    let memory_db_path = PathBuf::from(local_app_data)
-        .join("Better_Jarvis")
-        .join("memory")
-        .join("jarvis_memory.db");
+    // Initialize Runtime Paths & Storage Subsystems
+    let runtime_paths = RuntimePaths::resolve(custom_data_dir);
+    if let Err(e) = runtime_paths.ensure_directories() {
+        warn!("Failed to create runtime directories: {e}");
+    }
+    tools::browser_cdp::set_cdp_profiles_dir(runtime_paths.cdp_profiles_dir.clone());
 
-    let memory = Arc::new(match MemoryEngine::open(&memory_db_path, None).await {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("Falling back to in-memory SQLite database: {}", e);
-            MemoryEngine::in_memory().await?
-        }
-    });
+    // Initialize Memory Engine (SQLite with WAL mode + profile.md synchronization)
+    let memory = Arc::new(
+        match MemoryEngine::open(
+            &runtime_paths.db_path,
+            Some(runtime_paths.profile_path.clone()),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Falling back to in-memory SQLite database: {}", e);
+                MemoryEngine::in_memory().await?
+            }
+        },
+    );
 
     let os_controller = Arc::new(Win32StaOsController::spawn()?);
-    let telemetry = Arc::new(telemetry::DaemonTelemetry::new());
+    let telemetry = Arc::new(telemetry::DaemonTelemetry::with_log_path(Some(
+        runtime_paths.telemetry_log_path.clone(),
+    )));
     let shutdown_token = CancellationToken::new();
 
     let api_key = std::env::var(&config.api_key_env).ok();
@@ -768,4 +835,52 @@ async fn handle_client(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_runtime_paths_data_dir_isolation() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "jarvis_test_data_dir_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = RuntimePaths::resolve(Some(temp_dir.clone()));
+
+        assert_eq!(paths.data_dir, Some(temp_dir.clone()));
+        assert_eq!(paths.db_path, temp_dir.join("memory").join("jarvis_memory.db"));
+        assert_eq!(paths.profile_path, temp_dir.join("memory").join("profile.md"));
+        assert_eq!(
+            paths.telemetry_log_path,
+            temp_dir.join("logs").join("latency_metrics.jsonl")
+        );
+        assert_eq!(paths.cdp_profiles_dir, temp_dir.join("cdp_profiles"));
+
+        paths.ensure_directories().unwrap();
+        assert!(temp_dir.join("memory").exists());
+        assert!(temp_dir.join("logs").exists());
+        assert!(temp_dir.join("cdp_profiles").exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_runtime_paths_default_isolation() {
+        let paths = RuntimePaths::resolve(None);
+        assert_eq!(paths.data_dir, None);
+        assert!(paths.db_path.to_string_lossy().contains("Better_Jarvis"));
+        assert!(paths
+            .telemetry_log_path
+            .to_string_lossy()
+            .contains("Better_Jarvis"));
+        assert!(paths
+            .cdp_profiles_dir
+            .to_string_lossy()
+            .contains("Better_Jarvis"));
+    }
 }

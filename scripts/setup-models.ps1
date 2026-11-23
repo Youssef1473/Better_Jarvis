@@ -7,7 +7,7 @@ New-Item -ItemType Directory -Force -Path $ModelDir | Out-Null
 $Assets = @(
     @{
         Name   = "silero_vad.onnx"
-        Url    = "https://huggingface.co/snakers4/silero-vad/resolve/master/files/silero_vad.onnx"
+        Url    = "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx"
         MinBytes = 1500000
     },
     @{
@@ -28,6 +28,10 @@ $Assets = @(
 )
 
 $ManifestPath = Join-Path $ModelDir "manifest.sha256"
+$RootManifest = Join-Path $PSScriptRoot "..\manifest.sha256"
+if (-not (Test-Path $ManifestPath) -and (Test-Path $RootManifest)) {
+    $ManifestPath = $RootManifest
+}
 $PinnedHashes = @{}
 if (Test-Path $ManifestPath) {
     Get-Content $ManifestPath | ForEach-Object {

@@ -68,21 +68,43 @@ if ($hookMatches) {
 }
 Write-Host "     [PASS] Zero functional SetWindowsHookEx / WH_KEYBOARD_LL hooks" -ForegroundColor Green
 
-# D. Verify manifest.sha256 if present
-if (Test-Path "manifest.sha256") {
-    Write-Host "  -> Verifying manifest.sha256 integrity..." -ForegroundColor Yellow
-    $lines = Get-Content "manifest.sha256"
-    foreach ($line in $lines) {
-        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith("#")) { continue }
-        $parts = -split $line
-        if ($parts.Count -lt 2 -or $parts[0].Length -ne 64) {
-            throw "SECURITY AUDIT FAILURE: Invalid SHA-256 digest format in manifest.sha256: $line"
+# D. Verify manifest.sha256 (Mandatory Supply-Chain Model Pinning)
+Write-Host "  -> Verifying mandatory manifest.sha256 supply-chain pinning..." -ForegroundColor Yellow
+$manifestFile = "manifest.sha256"
+if (-not (Test-Path $manifestFile)) {
+    throw "SECURITY AUDIT FAILURE: Mandatory manifest.sha256 is missing from repository root"
+}
+$manifestContent = Get-Content $manifestFile
+$manifestLines = $manifestContent | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("#") }
+if ($manifestLines.Count -eq 0) {
+    throw "SECURITY AUDIT FAILURE: manifest.sha256 is empty"
+}
+
+$modelSearchDirs = @(
+    "models",
+    (Join-Path $env:LOCALAPPDATA "Better_Jarvis\models")
+)
+
+foreach ($line in $manifestLines) {
+    if ($line -notmatch '^[0-9a-fA-F]{64}\s+\S+$') {
+        throw "SECURITY AUDIT FAILURE: manifest.sha256 contains invalid entry format: '$line'"
+    }
+    $parts = -split $line
+    $expectedHash = $parts[0].ToLowerInvariant()
+    $assetName = $parts[1].Trim()
+
+    foreach ($mDir in $modelSearchDirs) {
+        $candidatePath = Join-Path $mDir $assetName
+        if (Test-Path $candidatePath) {
+            $actualHash = (Get-FileHash -Path $candidatePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHash) {
+                throw "SECURITY AUDIT FAILURE: Cryptographic checksum mismatch for $($assetName): expected $expectedHash, got $actualHash"
+            }
+            Write-Host "     [PASS] Verified cryptographic hash for $assetName" -ForegroundColor Green
         }
     }
-    Write-Host "     [PASS] manifest.sha256 verified cleanly" -ForegroundColor Green
-} else {
-    Write-Host "     [PASS] manifest.sha256 not present (optional)" -ForegroundColor Green
 }
+Write-Host "     [PASS] Mandatory manifest.sha256 validated cleanly" -ForegroundColor Green
 
 # -----------------------------------------------------------------------------
 # 3. Rust Full Test & Lint Gate
@@ -141,59 +163,115 @@ foreach ($t in $cppTests) {
 # -----------------------------------------------------------------------------
 Write-Host "`n[5/5] Live Binary Security & Crash-Safety Smoke Tests..." -ForegroundColor Cyan
 
-# Test A: Unauthorized Parent-PID Rejection
-Write-Host "  -> Verifying --parent-pid 999999 unauthorized startup rejection..." -ForegroundColor Yellow
-$proc = Start-Process -FilePath $daemonExe -ArgumentList "--parent-pid 999999" -Wait -PassThru -NoNewWindow
-if ($proc.ExitCode -eq 0) {
-    throw "SECURITY VIOLATION: jarvis-daemon accepted mismatched --parent-pid 999999 with exit code 0"
-}
-Write-Host "     [PASS] Mismatched parent-PID correctly aborted startup with exit code $($proc.ExitCode)" -ForegroundColor Green
+$smokeDataDir = Join-Path $env:TEMP ("jarvis_smoke_" + (Get-Random))
+New-Item -ItemType Directory -Force -Path $smokeDataDir | Out-Null
 
-# Test B: Hard-Kill Process Termination & Orphan Cleanup
-Write-Host "  -> Verifying forced termination (taskkill /F) and zero-orphan cleanup..." -ForegroundColor Yellow
-$daemonProc = Start-Process -FilePath $daemonExe -ArgumentList "--unsafe-allow-same-user-ipc" -PassThru -NoNewWindow
-Start-Sleep -Milliseconds 500
-Stop-Process -Id $daemonProc.Id -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 200
-$orphaned = Get-Process -Id $daemonProc.Id -ErrorAction SilentlyContinue
-if ($orphaned) {
-    throw "CRASH SAFETY FAILURE: Orphaned jarvis-daemon process $($daemonProc.Id) survived forced termination"
-}
-Write-Host "     [PASS] Process $($daemonProc.Id) terminated cleanly; zero orphaned processes remain" -ForegroundColor Green
+try {
+    # Test A: Unauthorized Parent-PID Rejection with isolated --data-dir
+    Write-Host "  -> Verifying --parent-pid 999999 unauthorized startup rejection..." -ForegroundColor Yellow
+    $proc = Start-Process -FilePath $daemonExe -ArgumentList "--parent-pid 999999 --data-dir `"$smokeDataDir`"" -Wait -PassThru -NoNewWindow
+    if ($proc.ExitCode -eq 0) {
+        throw "SECURITY VIOLATION: jarvis-daemon accepted mismatched --parent-pid 999999 with exit code 0"
+    }
+    Write-Host "     [PASS] Mismatched parent-PID correctly aborted startup with exit code $($proc.ExitCode)" -ForegroundColor Green
 
-# Test C: SQLite WAL Crash Durability & PRAGMA integrity_check
-Write-Host "  -> Verifying SQLite WAL crash durability and integrity_check..." -ForegroundColor Yellow
-$tempDbDir = Join-Path $env:TEMP ("jarvis_beta_gate_" + [Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Force -Path $tempDbDir | Out-Null
-$tempDbPath = Join-Path $tempDbDir "test_gate.db"
+    # Test B: Real Host -> Daemon Job Object Cascade & Clean Kill
+    Write-Host "  -> Verifying real Host -> Daemon Job Object cascade termination..." -ForegroundColor Yellow
 
-$pyScript = @"
+    # Set scoped dummy key so missing API key never halts host startup
+    $prevKey = [System.Environment]::GetEnvironmentVariable("GEMINI_API_KEY", "Process")
+    [System.Environment]::SetEnvironmentVariable("GEMINI_API_KEY", "smoke-test-dummy", "Process")
+
+    $hostProc = Start-Process -FilePath $hostExe -ArgumentList "--data-dir `"$smokeDataDir`"" -PassThru -NoNewWindow
+
+    # Poll for child daemon process spawned by host
+    $childDaemon = $null
+    for ($attempt = 0; $attempt -lt 25; $attempt++) {
+        Start-Sleep -Milliseconds 200
+        $daemons = Get-CimInstance Win32_Process -Filter "Name='jarvis-daemon.exe'" -ErrorAction SilentlyContinue
+        foreach ($d in $daemons) {
+            if ($d.ParentProcessId -eq $hostProc.Id) {
+                $childDaemon = $d
+                break
+            }
+        }
+        if ($childDaemon) { break }
+        if ($hostProc.HasExited) {
+            throw "SUPERVISION FAILURE: jarvis-host exited prematurely with code $($hostProc.ExitCode)"
+        }
+    }
+
+    if (-not $childDaemon) {
+        Stop-Process -Id $hostProc.Id -Force -ErrorAction SilentlyContinue
+        throw "SUPERVISION FAILURE: jarvis-host failed to spawn child jarvis-daemon within 5 seconds"
+    }
+
+    $daemonPid = $childDaemon.ProcessId
+    Write-Host "     [INFO] Detected child jarvis-daemon (PID $daemonPid) under host (PID $($hostProc.Id))" -ForegroundColor Cyan
+
+    # Verify SQLite DB was created strictly inside $smokeDataDir
+    $smokeDbPath = Join-Path $smokeDataDir "memory\jarvis_memory.db"
+    $dbCreated = $false
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        if (Test-Path $smokeDbPath) {
+            $dbCreated = $true
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $dbCreated) {
+        Stop-Process -Id $hostProc.Id -Force -ErrorAction SilentlyContinue
+        throw "ISOLATION FAILURE: jarvis_memory.db was not created under isolated smoke data-dir: $smokeDbPath"
+    }
+    Write-Host "     [PASS] SQLite memory DB cleanly initialized under isolated smoke data-dir" -ForegroundColor Green
+
+    # Terminate host ONLY via taskkill /F
+    Write-Host "     -> Executing taskkill /F on host process $($hostProc.Id) only..." -ForegroundColor Yellow
+    & taskkill /F /PID $hostProc.Id | Out-Null
+
+    # Wait up to 1,500 ms and assert BOTH host and daemon are dead
+    $reaped = $false
+    for ($attempt = 0; $attempt -lt 15; $attempt++) {
+        Start-Sleep -Milliseconds 100
+        $hAlive = Get-Process -Id $hostProc.Id -ErrorAction SilentlyContinue
+        $dAlive = Get-Process -Id $daemonPid -ErrorAction SilentlyContinue
+        if (-not $hAlive -and -not $dAlive) {
+            $reaped = $true
+            break
+        }
+    }
+
+    if (-not $reaped) {
+        Stop-Process -Id $daemonPid -Force -ErrorAction SilentlyContinue
+        throw "JOB OBJECT CASCADE FAILURE: Child daemon PID $daemonPid survived host kill"
+    }
+    Write-Host "     [PASS] Job Object cascade successfully reaped child daemon PID $daemonPid with zero orphans" -ForegroundColor Green
+
+    # Restore environment variable
+    [System.Environment]::SetEnvironmentVariable("GEMINI_API_KEY", $prevKey, "Process")
+
+    # Test C: SQLite WAL Crash Durability on the Killed Smoke DB
+    Write-Host "  -> Verifying SQLite WAL crash durability and integrity_check on smoke DB..." -ForegroundColor Yellow
+    $pyScript = @"
 import sqlite3
-con = sqlite3.connect(r'$tempDbPath')
-con.execute('PRAGMA journal_mode=WAL;')
-con.execute('PRAGMA synchronous=NORMAL;')
-con.execute('CREATE TABLE facts (id INTEGER PRIMARY KEY, k TEXT, v TEXT);')
-for i in range(100):
-    con.execute('INSERT INTO facts (k, v) VALUES (?, ?);', (f'k{i}', f'v{i}'))
-con.commit()
-con.close()
-
-con2 = sqlite3.connect(r'$tempDbPath')
-cur = con2.cursor()
+con = sqlite3.connect(r'$smokeDbPath')
+cur = con.cursor()
 cur.execute('PRAGMA integrity_check;')
 res = cur.fetchall()
-con2.close()
+con.close()
 if res != [('ok',)]:
     raise RuntimeError(f'Integrity check failed: {res}')
-print('INTEGRITY_CHECK_OK')
+print('SMOKE_DB_INTEGRITY_OK')
 "@
+    $checkOut = python -c "$pyScript"
+    if ($checkOut -notmatch "SMOKE_DB_INTEGRITY_OK") {
+        throw "SQLite WAL integrity check failed on killed smoke DB: $checkOut"
+    }
+    Write-Host "     [PASS] Killed smoke DB passed PRAGMA integrity_check ('ok')" -ForegroundColor Green
 
-$checkOut = python -c "$pyScript"
-if ($checkOut -notmatch "INTEGRITY_CHECK_OK") {
-    throw "SQLite WAL integrity check failed: $checkOut"
+} finally {
+    Remove-Item -Recurse -Force -Path $smokeDataDir -ErrorAction SilentlyContinue
 }
-Remove-Item -Recurse -Force -Path $tempDbDir
-Write-Host "     [PASS] SQLite WAL PRAGMA integrity_check returned 'ok'" -ForegroundColor Green
 
 Write-Host "`n=================================================================" -ForegroundColor Green
 Write-Host "   [SUCCESS] ALL BETA RELEASE CANDIDATE GATES PASSED!            " -ForegroundColor Green

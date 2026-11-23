@@ -136,4 +136,12 @@
   1. Verify `scripts/build.ps1` produces a clean release bundle for both `host-cpp` and `daemon-rust`.
   2. Run full Rust test suite (`cargo test --workspace`) + C++ unit/stress tests.
   3. Run a checklist verification of all 10 audit vulnerabilities (pipe ACL, CDP isolation, path sandbox, shell ban, taint escalation, WAL crash safety, WASAPI hot-swap, AEC, hook isolation, latency metrics).
-- **Exit Gate**: CEO final sign-off for **Beta Release Candidate**.
+- **Exit Gate**: CEO final sign-off for **Beta Release Candidate** (`v0.9.0-beta-rc1`).
+
+### TICKET-11: Pre-Distribution Polish & Full State Isolation
+- **Objective**: Close pre-distribution operational gaps and enforce complete runtime state isolation.
+- **Tasks**:
+  1. Complete runtime state isolation via `--data-dir <path>` across `daemon-rust` (`RuntimePaths`, SQLite WAL, profile mirror, telemetry logs, ephemeral CDP profiles) and `host-cpp` pass-through.
+  2. Implement mandatory supply-chain model pinning via `manifest.sha256` and enforce cryptographic SHA-256 validation in `scripts/verify-beta.ps1` and `scripts/setup-models.ps1`.
+  3. Upgrade verification suite `scripts/verify-beta.ps1` with isolated temporary smoke directory, true host `taskkill /F` Job Object cascade termination asserting zero orphan daemons, and WAL integrity check on the killed smoke database.
+- **Exit Gate**: 100% pass across all 5 verification phases of `scripts/verify-beta.ps1` with zero mutations to the user's live profile.

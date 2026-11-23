@@ -22,6 +22,10 @@ add_executable(jarvis-host WIN32
 target_include_directories(jarvis-host PRIVATE include)
 target_compile_definitions(jarvis-host PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
+if(MINGW)
+    target_link_options(jarvis-host PRIVATE -municode -s)
+endif()
+
 if(TARGET nlohmann_json::nlohmann_json)
     target_link_libraries(jarvis-host PRIVATE nlohmann_json::nlohmann_json)
 endif()
