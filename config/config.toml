@@ -1,0 +1,25 @@
+[system]
+hotkey = "CapsLock"
+wake_word_enabled = true
+wake_word = "jarvis"
+
+[audio]
+input_device = "default"
+output_device = "default"
+sample_rate = 16000
+
+[voice]
+model = "en_US-ryan-medium"
+speed = 1.0
+
+[ai]
+provider = "google_ai_studio"
+api_key_env = "GEMINI_API_KEY"
+fast_model = "gemini-3.5-flash-lite"
+heavy_model = "gemini-4-hydrogen"
+
+[security]
+allowed_directories = [
+    "C:\\Users\\Youssef\\Projects",
+    "C:\\Users\\Youssef\\Documents"
+]
