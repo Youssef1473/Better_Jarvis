@@ -6,7 +6,11 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -43,6 +47,11 @@ public:
         LARGE_INTEGER freq;
         QueryPerformanceFrequency(&freq);
         qpc_frequency_ = freq.QuadPart > 0 ? freq.QuadPart : 1;
+    }
+
+    void SetLogFilePath(const std::wstring& path) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        log_file_path_ = path;
     }
 
     void RecordPttUp(uint32_t turn_id) {
@@ -116,6 +125,11 @@ public:
         }
         completed_turns_.push_back(m);
         in_flight_.erase(it);
+
+        // Asynchronously persist completed turn edge timings to host JSONL metrics
+        if (!log_file_path_.empty()) {
+            AppendMetricsToFile(m);
+        }
     }
 
     void CancelTurn(uint32_t turn_id) {
@@ -232,7 +246,26 @@ private:
         return p;
     }
 
+    void AppendMetricsToFile(const CompletedTurnMetrics& m) {
+        try {
+            std::filesystem::path p(log_file_path_);
+            if (p.has_parent_path()) {
+                std::filesystem::create_directories(p.parent_path());
+            }
+            std::ofstream ofs(p, std::ios::app);
+            if (ofs.is_open()) {
+                ofs << "{\"turn_id\":" << m.turn_id
+                    << ",\"vad_to_stt_ms\":" << m.vad_to_stt_ms
+                    << ",\"stt_to_ipc_ms\":" << m.stt_to_ipc_ms
+                    << ",\"ipc_to_first_audio_ms\":" << m.ipc_to_first_audio_ms
+                    << ",\"end_to_end_ttfa_ms\":" << m.end_to_end_ttfa_ms
+                    << "}\n";
+            }
+        } catch (...) {}
+    }
+
     int64_t qpc_frequency_ = 1;
+    std::wstring log_file_path_;
     mutable std::mutex mutex_;
     std::unordered_map<uint32_t, TurnRawTimestamps> in_flight_;
     std::deque<CompletedTurnMetrics> completed_turns_;

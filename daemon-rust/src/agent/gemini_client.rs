@@ -282,6 +282,36 @@ impl GeminiClient {
                             },
                             "required": ["key", "value"]
                         }
+                    },
+                    {
+                        "name": "search_memory",
+                        "description": "Searches semantic memory and markdown notes for knowledge, facts, or instructions using hybrid vector and keyword search.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "query": {
+                                    "type": "STRING",
+                                    "description": "Search query or phrase to retrieve relevant knowledge notes."
+                                }
+                            },
+                            "required": ["query"]
+                        }
+                    },
+                    {
+                        "name": "inspect_active_window",
+                        "description": "Inspects metadata (window title and process name) of the active application window with fail-closed privacy guards.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "read_active_window_ocr",
+                        "description": "Captures the active application window in-memory, executes on-device WinRT OCR, and returns the recognized text with privacy filtering.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
                     }
                 ]
             }
@@ -642,7 +672,8 @@ impl GeminiClient {
                 }
 
                 if let Some(mem) = memory {
-                    match mem.db().upsert_fact(key, value, tier).await {
+                    let source_trusted = !taint.is_tainted();
+                    match mem.upsert_fact(key, value, tier, source_trusted).await {
                         Ok(_) => {
                             let _ = mem.sync().export_profile_atomic().await;
                             json!({
@@ -654,6 +685,82 @@ impl GeminiClient {
                     }
                 } else {
                     json!({ "status": "ERROR", "error": "Memory engine not available" })
+                }
+            }
+            "search_memory" => {
+                let query = match call.args.get("query").and_then(|v| v.as_str()) {
+                    Some(q) => q,
+                    None => return json!({ "error": "Missing required 'query' argument" }),
+                };
+                if let Some(mem) = memory {
+                    match mem.search_hybrid(query, 5).await {
+                        Ok(hits) => {
+                            let mut results = Vec::new();
+                            for hit in hits {
+                                let chunk = &hit.chunk;
+                                if !chunk.source_trusted {
+                                    taint.mark_tainted("memory:untrusted_note");
+                                }
+                                results.push(json!({
+                                    "heading": chunk.heading,
+                                    "path": chunk.path,
+                                    "content": chunk.content,
+                                    "source_trusted": chunk.source_trusted,
+                                    "rrf_score": hit.rrf_score,
+                                }));
+                            }
+                            json!({
+                                "status": "SUCCESS",
+                                "query": query,
+                                "results": results
+                            })
+                        }
+                        Err(e) => json!({ "status": "ERROR", "error": e.to_string() }),
+                    }
+                } else {
+                    json!({ "status": "ERROR", "error": "Memory engine not available" })
+                }
+            }
+            "inspect_active_window" => {
+                match crate::tools::screen_vision::get_active_window_metadata() {
+                    Ok(meta) => {
+                        taint.mark_tainted("vision:window_title");
+                        json!({
+                            "status": "SUCCESS",
+                            "process_name": meta.process_name,
+                            "window_title": meta.title,
+                            "width": meta.width,
+                            "height": meta.height,
+                        })
+                    }
+                    Err(e) => {
+                        warn!("inspect_active_window blocked or failed: {e}");
+                        json!({
+                            "status": "BLOCKED_OR_FAILED",
+                            "error": e.to_string()
+                        })
+                    }
+                }
+            }
+            "read_active_window_ocr" => {
+                let notifier = Some(confirmation_mgr.notifier());
+                match crate::tools::screen_vision::capture_and_ocr_active_window(notifier).await {
+                    Ok((meta, ocr_text)) => {
+                        taint.mark_tainted("vision:ocr");
+                        json!({
+                            "status": "SUCCESS",
+                            "process_name": meta.process_name,
+                            "window_title": meta.title,
+                            "ocr_text": ocr_text,
+                        })
+                    }
+                    Err(e) => {
+                        warn!("read_active_window_ocr blocked or failed: {e}");
+                        json!({
+                            "status": "BLOCKED_OR_FAILED",
+                            "error": e.to_string()
+                        })
+                    }
                 }
             }
             unknown => {
@@ -694,8 +801,11 @@ impl GeminiClient {
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
+        let turn_nonce = policy::generate_crypto_nonce();
+        let mut taint = TurnTaintState::new();
+
         let effective_prompt = if let Some(mem) = memory {
-            let context = mem.format_context_for_prompt().await;
+            let context = mem.retrieve_context_for_turn(prompt, 2048, &mut taint, &turn_nonce).await;
             if !context.is_empty() {
                 format!("{}\n\nUser Request: {}", context, prompt)
             } else {
@@ -710,8 +820,6 @@ impl GeminiClient {
             "parts": [{ "text": effective_prompt }]
         })];
 
-        let turn_nonce = policy::generate_crypto_nonce();
-        let mut taint = TurnTaintState::new();
         let mut executed_tools_in_turn = std::collections::HashSet::<(String, String)>::new();
 
         for turn in 1..=MAX_TOOL_TURNS {
@@ -969,7 +1077,7 @@ impl GeminiClient {
         turn_token: &CancellationToken,
         chunk_tx: Option<tokio::sync::mpsc::Sender<TtsChunk>>,
         mut on_ttft: impl FnMut() + Send,
-    ) -> Result<(String, ModelSelection)> {
+    ) -> Result<(String, ModelSelection, Option<f64>)> {
         let api_key = self
             .api_key
             .as_deref()
@@ -982,15 +1090,20 @@ impl GeminiClient {
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        let effective_prompt = if let Some(mem) = memory {
-            let context = mem.format_context_for_prompt().await;
+        let turn_nonce = policy::generate_crypto_nonce();
+        let mut taint = TurnTaintState::new();
+
+        let t_mem_start = std::time::Instant::now();
+        let (effective_prompt, memory_recall_ms) = if let Some(mem) = memory {
+            let context = mem.retrieve_context_for_turn(prompt, 2048, &mut taint, &turn_nonce).await;
+            let elapsed_ms = t_mem_start.elapsed().as_secs_f64() * 1000.0;
             if !context.is_empty() {
-                format!("{}\n\nUser Request: {}", context, prompt)
+                (format!("{}\n\nUser Request: {}", context, prompt), Some(elapsed_ms))
             } else {
-                prompt.to_string()
+                (prompt.to_string(), Some(elapsed_ms))
             }
         } else {
-            prompt.to_string()
+            (prompt.to_string(), None)
         };
 
         let mut contents = vec![json!({
@@ -998,8 +1111,6 @@ impl GeminiClient {
             "parts": [{ "text": effective_prompt }]
         })];
 
-        let turn_nonce = policy::generate_crypto_nonce();
-        let mut taint = TurnTaintState::new();
         let mut executed_tools_in_turn = std::collections::HashSet::<(String, String)>::new();
 
         for turn in 1..=MAX_TOOL_TURNS {
@@ -1096,6 +1207,7 @@ impl GeminiClient {
                 return Ok((
                     streamed_text,
                     model_sel,
+                    memory_recall_ms,
                 ));
             }
         }

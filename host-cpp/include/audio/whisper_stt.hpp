@@ -53,6 +53,9 @@ public:
     /// Cleans up raw Whisper output (trims whitespace, quotes, artifacts).
     static std::string SanitizeTranscript(const std::string& raw_text);
 
+    /// Synchronously transcribes a 16 kHz float PCM audio buffer.
+    std::string Transcribe(const std::vector<float>& pcm_16k);
+
     /// Detects classic Whisper silent-segment hallucinations (e.g. [BLANK_AUDIO], [Music]).
     static bool IsHallucination(const std::string& text);
 

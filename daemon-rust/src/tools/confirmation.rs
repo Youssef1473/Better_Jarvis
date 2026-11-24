@@ -35,6 +35,16 @@ impl ConfirmationManager {
         self.notifier.subscribe()
     }
 
+    /// Returns a clone of the outgoing HUD broadcast sender.
+    pub fn notifier(&self) -> tokio::sync::broadcast::Sender<serde_json::Value> {
+        self.notifier.clone()
+    }
+
+    /// Broadcasts an arbitrary HUD notification down the Named Pipe.
+    pub fn notify(&self, value: serde_json::Value) {
+        let _ = self.notifier.send(value);
+    }
+
     /// Allocates a new pending confirmation request and waits for approval.
     /// Safely defaults to `false` (DENIED) on timeout or drop.
     pub async fn request_confirmation(&self, description: &str, timeout_ms: u64) -> bool {

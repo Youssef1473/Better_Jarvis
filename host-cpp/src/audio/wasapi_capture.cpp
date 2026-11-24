@@ -56,6 +56,34 @@ struct IAcousticEchoCancellationControl : public IUnknown {
 static const IID& IID_IAcousticEchoCancellationControl_Local = __uuidof(IAcousticEchoCancellationControl);
 #endif
 
+#ifndef __IAudioClient3_INTERFACE_DEFINED__
+#define __IAudioClient3_INTERFACE_DEFINED__
+static const IID IID_IAudioClient3_Local = {
+    0x7ed4ee07, 0x8e67, 0x4cd4, {0x8c, 0x1a, 0x2b, 0x7a, 0x59, 0x87, 0xad, 0x42}
+};
+
+struct IAudioClient3 : public IAudioClient2 {
+    virtual HRESULT STDMETHODCALLTYPE GetSharedModeEnginePeriod(
+        const WAVEFORMATEX *pFormat,
+        UINT32 *pDefaultPeriodInFrames,
+        UINT32 *pFundamentalPeriodInFrames,
+        UINT32 *pMinPeriodInFrames,
+        UINT32 *pMaxPeriodInFrames) = 0;
+
+    virtual HRESULT STDMETHODCALLTYPE GetCurrentSharedModeEnginePeriod(
+        WAVEFORMATEX **ppFormat,
+        UINT32 *pCurrentPeriodInFrames) = 0;
+
+    virtual HRESULT STDMETHODCALLTYPE InitializeSharedAudioStream(
+        DWORD StreamFlags,
+        UINT32 PeriodInFrames,
+        const WAVEFORMATEX *pFormat,
+        LPCGUID AudioSessionGuid) = 0;
+};
+#else
+static const IID& IID_IAudioClient3_Local = __uuidof(IAudioClient3);
+#endif
+
 constexpr double kTargetSampleRate = 16000.0;
 constexpr REFERENCE_TIME kBufferDuration100ns = 200000; // 20 ms buffer
 
@@ -255,50 +283,92 @@ bool WasapiCapture::InitEndpoint(
                          AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
                          AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
 
-    hr = (*client)->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        stream_flags,
-        kBufferDuration100ns,
-        0,
-        reinterpret_cast<WAVEFORMATEX*>(&wfx16k),
-        nullptr);
+    // Opportunistic IAudioClient3 low-latency shared-mode probing
+    IAudioClient3* client3 = nullptr;
+    bool client3_initialized = false;
+    if (SUCCEEDED((*client)->QueryInterface(IID_IAudioClient3_Local, reinterpret_cast<void**>(&client3))) && client3) {
+        UINT32 def_period = 0, fund_period = 0, min_period = 0, max_period = 0;
+        HRESULT period_hr = client3->GetSharedModeEnginePeriod(
+            reinterpret_cast<const WAVEFORMATEX*>(&wfx16k),
+            &def_period, &fund_period, &min_period, &max_period);
 
-    if (SUCCEEDED(hr)) {
-        *mix_format = reinterpret_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEXTENSIBLE)));
-        if (!*mix_format) {
-            (*client)->Release();
-            *client = nullptr;
-            return false;
+        if (SUCCEEDED(period_hr) && min_period > 0) {
+            // Safe clamp min_period to a floor of >= 2 ms (32 frames @ 16 kHz) to prevent DPC crackle on laptops
+            const UINT32 min_safe_frames = static_cast<UINT32>(16000 * 0.002f);
+            UINT32 safe_period = std::max(min_period, min_safe_frames);
+            if (fund_period > 0) {
+                safe_period = ((safe_period + fund_period - 1) / fund_period) * fund_period;
+            }
+            safe_period = std::clamp(safe_period, min_period, max_period);
+
+            hr = client3->InitializeSharedAudioStream(
+                stream_flags,
+                safe_period,
+                reinterpret_cast<const WAVEFORMATEX*>(&wfx16k),
+                nullptr);
+
+            if (SUCCEEDED(hr)) {
+                *mix_format = reinterpret_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEXTENSIBLE)));
+                if (*mix_format) {
+                    std::memcpy(*mix_format, &wfx16k, sizeof(WAVEFORMATEXTENSIBLE));
+                    native_sample_rate_ = 16000;
+                    native_channels_ = 1;
+                    negotiated_period_ms_.store(static_cast<float>(safe_period) * 1000.0f / 16000.0f, std::memory_order_relaxed);
+                    client3_initialized = true;
+                }
+            }
         }
-        std::memcpy(*mix_format, &wfx16k, sizeof(WAVEFORMATEXTENSIBLE));
-        native_sample_rate_ = 16000;
-        native_channels_ = 1;
-    } else {
-        // Fallback: query native device mix format
-        hr = (*client)->GetMixFormat(mix_format);
-        if (FAILED(hr) || !*mix_format) {
-            (*client)->Release();
-            *client = nullptr;
-            return false;
-        }
+        client3->Release();
+    }
 
-        native_sample_rate_ = (*mix_format)->nSamplesPerSec;
-        native_channels_ = (*mix_format)->nChannels;
-
+    if (!client3_initialized) {
         hr = (*client)->Initialize(
             AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            stream_flags,
             kBufferDuration100ns,
             0,
-            *mix_format,
+            reinterpret_cast<WAVEFORMATEX*>(&wfx16k),
             nullptr);
 
-        if (FAILED(hr)) {
-            CoTaskMemFree(*mix_format);
-            *mix_format = nullptr;
-            (*client)->Release();
-            *client = nullptr;
-            return false;
+        if (SUCCEEDED(hr)) {
+            *mix_format = reinterpret_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEXTENSIBLE)));
+            if (!*mix_format) {
+                (*client)->Release();
+                *client = nullptr;
+                return false;
+            }
+            std::memcpy(*mix_format, &wfx16k, sizeof(WAVEFORMATEXTENSIBLE));
+            native_sample_rate_ = 16000;
+            native_channels_ = 1;
+            negotiated_period_ms_.store(10.0f, std::memory_order_relaxed);
+        } else {
+            // Fallback: query native device mix format
+            hr = (*client)->GetMixFormat(mix_format);
+            if (FAILED(hr) || !*mix_format) {
+                (*client)->Release();
+                *client = nullptr;
+                return false;
+            }
+
+            native_sample_rate_ = (*mix_format)->nSamplesPerSec;
+            native_channels_ = (*mix_format)->nChannels;
+
+            hr = (*client)->Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                kBufferDuration100ns,
+                0,
+                *mix_format,
+                nullptr);
+
+            if (FAILED(hr)) {
+                CoTaskMemFree(*mix_format);
+                *mix_format = nullptr;
+                (*client)->Release();
+                *client = nullptr;
+                return false;
+            }
+            negotiated_period_ms_.store(10.0f, std::memory_order_relaxed);
         }
     }
 

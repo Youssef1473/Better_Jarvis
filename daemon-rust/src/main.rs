@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod config;
+pub mod diagnostics;
 mod ipc;
 pub mod memory;
 pub mod security;
@@ -187,13 +188,15 @@ async fn main() -> Result<()> {
     if let Err(e) = runtime_paths.ensure_directories() {
         warn!("Failed to create runtime directories: {e}");
     }
+    diagnostics::init_panic_hook(&runtime_paths.telemetry_log_path.parent().unwrap().join("crashes"));
     tools::browser_cdp::set_cdp_profiles_dir(runtime_paths.cdp_profiles_dir.clone());
 
-    // Initialize Memory Engine (SQLite with WAL mode + profile.md synchronization)
+    // Initialize Memory Engine (SQLite with WAL mode + profile.md synchronization + Local Neural Embedder)
     let memory = Arc::new(
         match MemoryEngine::open(
             &runtime_paths.db_path,
             Some(runtime_paths.profile_path.clone()),
+            runtime_paths.data_dir.as_deref(),
         )
         .await
         {
@@ -301,8 +304,8 @@ async fn main() -> Result<()> {
     }
 
     info!("Initiating clean shutdown sequence...");
-    if let Err(e) = memory.db().shutdown().await {
-        warn!("Error shutting down db actor: {e}");
+    if let Err(e) = memory.shutdown().await {
+        warn!("Error shutting down memory engine: {e}");
     }
     if let Err(e) = os_controller.shutdown().await {
         warn!("Error shutting down os_controller actor: {e}");
@@ -491,7 +494,8 @@ async fn process_utterance(
             active_timing.t_llm_done = Some(std::time::Instant::now());
 
             match res {
-                Ok((reply, model_sel)) => {
+                Ok((reply, model_sel, memory_recall_ms)) => {
+                    active_timing.memory_recall_ms = memory_recall_ms;
                     active_timing.path = match model_sel.tier {
                         crate::agent::model_router::ModelTier::Fast => telemetry::ExecutionPath::CloudFast,
                         crate::agent::model_router::ModelTier::Heavy => telemetry::ExecutionPath::CloudHeavy,

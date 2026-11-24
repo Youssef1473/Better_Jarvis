@@ -18,8 +18,8 @@ public:
     static constexpr size_t kSampleRate    = 16000;
     static constexpr size_t kFrameSize     = 160;  // 10 ms @ 16 kHz
     static constexpr size_t kFilterTaps    = 512;  // 32 ms echo tail
-    static constexpr size_t kHistorySize   = 2048; // Power of 2 (128 ms history)
-    static constexpr size_t kHistMask      = kHistorySize - 1;
+    static constexpr size_t kHistorySize   = 4096; // Power of 2 (256 ms history @ 16 kHz)
+    static constexpr size_t kHistMask      = kHistorySize - 1; // 4095
 
     AecProcessor();
     ~AecProcessor() = default;
@@ -29,9 +29,12 @@ public:
     AecProcessor& operator=(const AecProcessor&) = delete;
 
     /// Configures the estimated speaker-to-mic bulk delay in samples (e.g. 160 = 10 ms).
-    void SetBulkDelaySamples(size_t delay_samples) noexcept {
-        bulk_delay_ = std::min(delay_samples, kHistorySize - kFilterTaps - 1);
-    }
+    /// Clamped strictly to [0, 3200] (0 ms to 200 ms, preserving headroom for 512-tap NLMS tail).
+    /// Whenever delay shifts by more than 32 samples (2 ms), automatically zeroes FIR weights.
+    void SetBulkDelaySamples(size_t delay_samples) noexcept;
+
+    /// Current configured bulk delay in samples.
+    size_t BulkDelaySamples() const noexcept { return bulk_delay_; }
 
     /// Processes exactly one 160-sample (10 ms) frame with zero heap allocations and zero locks.
     void ProcessFrame(
@@ -59,12 +62,13 @@ public:
 
 private:
     std::vector<float> weights_;     // kFilterTaps (512)
-    std::vector<float> ref_history_; // kHistorySize (2048, circular)
+    std::vector<float> ref_history_; // kHistorySize (4096, circular)
     size_t             write_idx_{0};
     size_t             bulk_delay_{160}; // 10 ms default
 
     float erle_db_{0.0f};
     bool  is_double_talk_{false};
+    float max_ref_energy_{0.0f};
 
     float step_size_{0.25f}; // NLMS learning rate mu
     float epsilon_{1e-3f};   // Regularization factor

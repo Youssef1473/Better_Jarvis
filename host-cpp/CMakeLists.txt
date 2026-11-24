@@ -9,14 +9,47 @@ else()
     FetchContent_MakeAvailable(nlohmann_json)
 endif()
 
+# Mandatory Native Inference Linkage (Zero Stubs in Production)
+set(UCRT64_ROOT "C:/msys64/ucrt64")
+set(ONNXRUNTIME_DLL "${UCRT64_ROOT}/bin/onnxruntime.dll")
+set(WHISPER_LIB "${UCRT64_ROOT}/lib/libwhisper.dll.a")
+set(GGML_LIB "${UCRT64_ROOT}/lib/libggml.dll.a")
+set(ESPEAK_NG_LIB "${UCRT64_ROOT}/lib/libespeak-ng.dll.a")
+
+if(NOT EXISTS "${ONNXRUNTIME_DLL}" OR NOT EXISTS "${WHISPER_LIB}" OR NOT EXISTS "${ESPEAK_NG_LIB}")
+    message(FATAL_ERROR "TICKET-12 HARD FAILURE: Mandatory native inference libraries missing from ${UCRT64_ROOT}! Ensure onnxruntime, whisper.cpp, and espeak-ng are installed.")
+endif()
+
+message(STATUS "Verified Native Inference Libraries: ONNX Runtime, Whisper.cpp, eSpeak-NG")
+
+add_compile_definitions(
+    JARVIS_HAS_ONNXRUNTIME=1
+    JARVIS_HAS_WHISPER=1
+    JARVIS_HAS_PIPER=1
+)
+
+include_directories(
+    include
+    "${UCRT64_ROOT}/include"
+    "${UCRT64_ROOT}/include/onnxruntime"
+    "${UCRT64_ROOT}/include/espeak-ng"
+)
+
+link_directories(
+    "${UCRT64_ROOT}/lib"
+    "${UCRT64_ROOT}/bin"
+)
+
 add_executable(jarvis-host WIN32
     src/main.cpp
     src/audio/wasapi_capture.cpp
     src/audio/aec_processor.cpp
+    src/audio/aec_delay_estimator.cpp
     src/audio/silero_vad.cpp
     src/audio/whisper_stt.cpp
     src/audio/piper_tts.cpp
     src/input/hotkey_listener.cpp
+    src/diagnostics/crash_handler.cpp
 )
 
 target_include_directories(jarvis-host PRIVATE include)
@@ -31,6 +64,10 @@ if(TARGET nlohmann_json::nlohmann_json)
 endif()
 
 target_link_libraries(jarvis-host PRIVATE
+    "${ONNXRUNTIME_DLL}"
+    whisper
+    ggml
+    espeak-ng
     user32
     gdi32
     dwmapi
@@ -56,11 +93,14 @@ target_compile_definitions(test_resampler PRIVATE UNICODE _UNICODE WIN32_LEAN_AN
 add_executable(test_aec
     tests/test_aec.cpp
     src/audio/aec_processor.cpp
+    src/audio/aec_delay_estimator.cpp
     src/audio/piper_tts.cpp
 )
 target_include_directories(test_aec PRIVATE include)
 target_compile_definitions(test_aec PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(test_aec PRIVATE
+    "${ONNXRUNTIME_DLL}"
+    espeak-ng
     user32
     ole32
     uuid
@@ -89,6 +129,9 @@ add_executable(test_vad
 )
 target_include_directories(test_vad PRIVATE include)
 target_compile_definitions(test_vad PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(test_vad PRIVATE
+    "${ONNXRUNTIME_DLL}"
+)
 
 add_executable(test_piper_tts
     tests/test_piper_tts.cpp
@@ -97,6 +140,8 @@ add_executable(test_piper_tts
 target_include_directories(test_piper_tts PRIVATE include)
 target_compile_definitions(test_piper_tts PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(test_piper_tts PRIVATE
+    "${ONNXRUNTIME_DLL}"
+    espeak-ng
     ole32
     avrt
     user32
@@ -108,4 +153,15 @@ add_executable(test_whisper_stt
 )
 target_include_directories(test_whisper_stt PRIVATE include)
 target_compile_definitions(test_whisper_stt PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(test_whisper_stt PRIVATE
+    whisper
+    ggml
+)
+
+add_executable(test_crash_handler
+    tests/test_crash_handler.cpp
+    src/diagnostics/crash_handler.cpp
+)
+target_include_directories(test_crash_handler PRIVATE include)
+target_compile_definitions(test_crash_handler PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 

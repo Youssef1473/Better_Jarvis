@@ -24,6 +24,16 @@ $Assets = @(
         Name   = "en_US-ryan-medium.onnx.json"
         Url    = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/ryan/medium/en_US-ryan-medium.onnx.json"
         MinBytes = 1000
+    },
+    @{
+        Name   = "all-MiniLM-L6-v2-q8.onnx"
+        Url    = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx"
+        MinBytes = 20000000
+    },
+    @{
+        Name   = "all-MiniLM-L6-v2-tokenizer.json"
+        Url    = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+        MinBytes = 500000
     }
 )
 

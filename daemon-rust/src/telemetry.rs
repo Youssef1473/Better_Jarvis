@@ -39,6 +39,8 @@ pub struct TurnTelemetryRecord {
     pub routing_reason: String,
     pub ipc_rx_to_router_ms: f64,
     pub router_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_recall_ms: Option<f64>,
     pub llm_ttft_ms: Option<f64>,
     pub first_tts_chunk_dispatch_ms: Option<f64>,
     pub llm_total_ms: Option<f64>,
@@ -89,6 +91,7 @@ pub struct ActiveTurnTiming {
     pub t_ipc_rx: Instant,
     pub t_router_start: Option<Instant>,
     pub t_router_done: Option<Instant>,
+    pub memory_recall_ms: Option<f64>,
     pub t_llm_start: Option<Instant>,
     pub t_llm_first_token: Option<Instant>,
     pub t_first_tts_dispatch: Option<Instant>,
@@ -104,6 +107,7 @@ impl ActiveTurnTiming {
             t_ipc_rx: Instant::now(),
             t_router_start: None,
             t_router_done: None,
+            memory_recall_ms: None,
             t_llm_start: None,
             t_llm_first_token: None,
             t_first_tts_dispatch: None,
@@ -207,6 +211,7 @@ impl DaemonTelemetry {
             routing_reason: timing.routing_reason,
             ipc_rx_to_router_ms,
             router_ms,
+            memory_recall_ms: timing.memory_recall_ms,
             llm_ttft_ms,
             first_tts_chunk_dispatch_ms,
             llm_total_ms,
@@ -292,6 +297,7 @@ mod tests {
                 routing_reason: "fast_intent".to_string(),
                 ipc_rx_to_router_ms: 1.0,
                 router_ms: 2.0,
+                memory_recall_ms: None,
                 llm_ttft_ms: None,
                 first_tts_chunk_dispatch_ms: Some(5.0),
                 llm_total_ms: None,
@@ -320,6 +326,7 @@ mod tests {
             routing_reason: "volume".to_string(),
             ipc_rx_to_router_ms: 0.5,
             router_ms: 1.0,
+            memory_recall_ms: None,
             llm_ttft_ms: None,
             first_tts_chunk_dispatch_ms: Some(2.0),
             llm_total_ms: None,
@@ -332,6 +339,7 @@ mod tests {
             routing_reason: "cloud_qa".to_string(),
             ipc_rx_to_router_ms: 0.5,
             router_ms: 1.0,
+            memory_recall_ms: None,
             llm_ttft_ms: Some(180.0),
             first_tts_chunk_dispatch_ms: Some(220.0),
             llm_total_ms: Some(450.0),
@@ -345,5 +353,28 @@ mod tests {
 
         assert!((summary.fast_path_summary.p50_ms - 2.5).abs() < 1e-4);
         assert!((summary.cloud_path_summary.p50_ms - 455.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_telemetry_serializes_memory_recall_ms() {
+        let record = TurnTelemetryRecord {
+            turn_id: 42,
+            path: ExecutionPath::CloudFast,
+            routing_reason: "general_query".into(),
+            ipc_rx_to_router_ms: 0.12,
+            router_ms: 0.45,
+            memory_recall_ms: Some(8.75),
+            llm_ttft_ms: Some(210.5),
+            first_tts_chunk_dispatch_ms: Some(250.0),
+            llm_total_ms: Some(400.0),
+            total_daemon_turn_ms: 410.0,
+        };
+
+        let json_str = serde_json::to_string(&record).unwrap();
+        assert!(json_str.contains("\"memory_recall_ms\":8.75"));
+
+        let deserialized: TurnTelemetryRecord = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(deserialized.memory_recall_ms, Some(8.75));
+        assert_eq!(deserialized.turn_id, 42);
     }
 }

@@ -106,6 +106,14 @@ foreach ($line in $manifestLines) {
 }
 Write-Host "     [PASS] Mandatory manifest.sha256 validated cleanly" -ForegroundColor Green
 
+# E. Native Inference Definitions & Zero Stub Mode in Release Artifacts
+Write-Host "  -> Auditing CMake configuration for mandatory native inference definitions..." -ForegroundColor Yellow
+$cmakeContent = Get-Content "host-cpp/CMakeLists.txt" -Raw
+if ($cmakeContent -notmatch "JARVIS_HAS_ONNXRUNTIME=1" -or $cmakeContent -notmatch "JARVIS_HAS_WHISPER=1" -or $cmakeContent -notmatch "JARVIS_HAS_PIPER=1") {
+    throw "INFERENCE AUDIT FAILURE: host-cpp/CMakeLists.txt missing mandatory JARVIS_HAS_* definitions"
+}
+Write-Host "     [PASS] Mandatory JARVIS_HAS_ONNXRUNTIME, JARVIS_HAS_WHISPER, JARVIS_HAS_PIPER verified" -ForegroundColor Green
+
 # -----------------------------------------------------------------------------
 # 3. Rust Full Test & Lint Gate
 # -----------------------------------------------------------------------------
@@ -129,24 +137,39 @@ Write-Host "     [PASS] Zero Rust compiler or Clippy warnings" -ForegroundColor 
 # 4. C++ Full Test Suite Gate
 # -----------------------------------------------------------------------------
 Write-Host "`n[4/5] C++ Full Test Suite Gate..." -ForegroundColor Cyan
-New-Item -ItemType Directory -Force -Path "build/tests" | Out-Null
+$testDir = "build/tests"
+New-Item -ItemType Directory -Force -Path $testDir | Out-Null
+
+# Stage UCRT64 runtime inference DLLs & data for tests
+$ucrtBin = "C:\msys64\ucrt64\bin"
+Copy-Item "$ucrtBin\onnxruntime.dll" -Destination "$testDir\onnxruntime.dll" -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $ucrtBin -Filter "*whisper*.dll" | ForEach-Object { Copy-Item $_.FullName -Destination $testDir -Force }
+Get-ChildItem -Path $ucrtBin -Filter "*ggml*.dll" | ForEach-Object { Copy-Item $_.FullName -Destination $testDir -Force }
+Get-ChildItem -Path $ucrtBin -Filter "*espeak*.dll" | ForEach-Object { Copy-Item $_.FullName -Destination $testDir -Force }
+Get-ChildItem -Path $ucrtBin -Filter "*pcaudio*.dll" | ForEach-Object { Copy-Item $_.FullName -Destination $testDir -Force }
+Get-ChildItem -Path $ucrtBin -Filter "*gomp*.dll" | ForEach-Object { Copy-Item $_.FullName -Destination $testDir -Force }
+Get-ChildItem -Path $ucrtBin -Filter "*winpthread*.dll" | ForEach-Object { Copy-Item $_.FullName -Destination $testDir -Force }
+if (Test-Path "C:\msys64\ucrt64\share\espeak-ng-data") {
+    Copy-Item -Recurse -Force "C:\msys64\ucrt64\share\espeak-ng-data" -Destination "$testDir\espeak-ng-data"
+}
+$env:PATH = "$ucrtBin;$env:PATH"
 
 $cppTests = @(
     @{ Name = "test_frame_codec"; Src = "host-cpp/tests/test_frame_codec.cpp"; ExtraSrc = ""; Libs = "" },
     @{ Name = "test_ring_buffer"; Src = "host-cpp/tests/test_ring_buffer.cpp"; ExtraSrc = ""; Libs = "" },
     @{ Name = "test_resampler"; Src = "host-cpp/tests/test_resampler.cpp"; ExtraSrc = ""; Libs = "" },
-    @{ Name = "test_aec"; Src = "host-cpp/tests/test_aec.cpp"; ExtraSrc = "host-cpp/src/audio/aec_processor.cpp host-cpp/src/audio/piper_tts.cpp"; Libs = "-lole32 -lavrt -luser32" },
+    @{ Name = "test_aec"; Src = "host-cpp/tests/test_aec.cpp"; ExtraSrc = "host-cpp/src/audio/aec_processor.cpp host-cpp/src/audio/aec_delay_estimator.cpp host-cpp/src/audio/piper_tts.cpp"; Libs = "C:/msys64/ucrt64/bin/onnxruntime.dll -L C:/msys64/ucrt64/lib -lespeak-ng -lole32 -lavrt -luser32" },
     @{ Name = "test_hotkey_listener"; Src = "host-cpp/tests/test_hotkey_listener.cpp"; ExtraSrc = "host-cpp/src/input/hotkey_listener.cpp"; Libs = "-luser32" },
     @{ Name = "test_latency_tracker"; Src = "host-cpp/tests/test_latency_tracker.cpp"; ExtraSrc = ""; Libs = "" },
-    @{ Name = "test_vad"; Src = "host-cpp/tests/test_vad.cpp"; ExtraSrc = "host-cpp/src/audio/silero_vad.cpp"; Libs = "" },
-    @{ Name = "test_piper_tts"; Src = "host-cpp/tests/test_piper_tts.cpp"; ExtraSrc = "host-cpp/src/audio/piper_tts.cpp"; Libs = "-lole32 -lavrt -luser32" },
-    @{ Name = "test_whisper_stt"; Src = "host-cpp/tests/test_whisper_stt.cpp"; ExtraSrc = "host-cpp/src/audio/whisper_stt.cpp"; Libs = "" }
+    @{ Name = "test_vad"; Src = "host-cpp/tests/test_vad.cpp"; ExtraSrc = "host-cpp/src/audio/silero_vad.cpp"; Libs = "C:/msys64/ucrt64/bin/onnxruntime.dll" },
+    @{ Name = "test_piper_tts"; Src = "host-cpp/tests/test_piper_tts.cpp"; ExtraSrc = "host-cpp/src/audio/piper_tts.cpp"; Libs = "C:/msys64/ucrt64/bin/onnxruntime.dll -L C:/msys64/ucrt64/lib -lespeak-ng -lole32 -lavrt -luser32" },
+    @{ Name = "test_whisper_stt"; Src = "host-cpp/tests/test_whisper_stt.cpp"; ExtraSrc = "host-cpp/src/audio/whisper_stt.cpp"; Libs = "-L C:/msys64/ucrt64/lib -lwhisper -lggml" }
 )
 
 foreach ($t in $cppTests) {
     $exe = "build/tests/$($t.Name).exe"
     Write-Host "  -> Compiling and running C++ test: $($t.Name)..." -ForegroundColor Yellow
-    $compileCmd = "g++ -std=c++20 -O2 -Wall -Wextra -Werror $($t.Src) $($t.ExtraSrc) -I host-cpp/include $($t.Libs) -o $exe"
+    $compileCmd = "g++ -std=c++20 -O2 -Wall -Wextra -Werror -DJARVIS_HAS_ONNXRUNTIME=1 -DJARVIS_HAS_WHISPER=1 -DJARVIS_HAS_PIPER=1 $($t.Src) $($t.ExtraSrc) -I host-cpp/include -I C:/msys64/ucrt64/include -I C:/msys64/ucrt64/include/onnxruntime -I C:/msys64/ucrt64/include/espeak-ng $($t.Libs) -o $exe"
     Invoke-Expression $compileCmd
     if ($LASTEXITCODE -ne 0) {
         throw "C++ test compilation failed for $($t.Name)"
@@ -208,6 +231,13 @@ try {
 
     $daemonPid = $childDaemon.ProcessId
     Write-Host "     [INFO] Detected child jarvis-daemon (PID $daemonPid) under host (PID $($hostProc.Id))" -ForegroundColor Cyan
+
+    # Measure live working set RAM for both processes
+    Start-Sleep -Milliseconds 500
+    $hRam = [math]::Round((Get-Process -Id $hostProc.Id -ErrorAction SilentlyContinue).WorkingSet64 / 1MB, 1)
+    $dRam = [math]::Round((Get-Process -Id $daemonPid -ErrorAction SilentlyContinue).WorkingSet64 / 1MB, 1)
+    $totalRam = [math]::Round($hRam + $dRam, 1)
+    Write-Host "     [INFO] Live Working Set RAM: jarvis-host = $hRam MB, jarvis-daemon = $dRam MB (Total: $totalRam MB)" -ForegroundColor Cyan
 
     # Verify SQLite DB was created strictly inside $smokeDataDir
     $smokeDbPath = Join-Path $smokeDataDir "memory\jarvis_memory.db"

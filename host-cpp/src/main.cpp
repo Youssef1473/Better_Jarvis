@@ -12,18 +12,21 @@
 #include <thread>
 #include <vector>
 #include <iostream>
+#include <iomanip>
 
 #include <nlohmann/json.hpp>
 #include "ipc/frame_codec.hpp"
 #include "audio/mmcss_guard.hpp"
 #include "audio/ring_buffer.hpp"
 #include "audio/aec_processor.hpp"
+#include "audio/aec_delay_estimator.hpp"
 #include "audio/wasapi_capture.hpp"
 #include "audio/silero_vad.hpp"
 #include "audio/whisper_stt.hpp"
 #include "audio/piper_tts.hpp"
 #include "input/hotkey_listener.hpp"
 #include "telemetry/latency_tracker.hpp"
+#include "diagnostics/crash_handler.hpp"
 
 using json = nlohmann::json;
 
@@ -72,10 +75,16 @@ std::atomic<uint64_t> g_confirm_timeout_ms{8000};
 std::mutex            g_confirm_mutex;
 std::wstring          g_confirm_command;
 
+// Vision Capture State
+std::atomic<bool>     g_vision_active{false};
+std::mutex            g_vision_mutex;
+std::wstring          g_vision_app;
+
 // Audio Subsystems
 jarvis::audio::SpscRingBuffer<32768>           g_raw_mic_buffer;
 jarvis::audio::SpscRingBuffer<32768>           g_clean_ring_buffer;
 jarvis::audio::AecProcessor                    g_aec;
+jarvis::audio::AecDelayEstimator              g_delay_estimator;
 std::atomic<uint32_t>                          g_active_turn_id{1};
 std::atomic<uint32_t>                          g_cancelled_turn_id{0};
 jarvis::telemetry::LatencyTracker              g_latency_tracker;
@@ -393,6 +402,17 @@ void IpcWorkerLoop() {
                             if (g_hwnd) {
                                 PostMessageW(g_hwnd, WM_APP_CONFIRMATION, 0, 0);
                             }
+                        } else if (method == "hud.vision_capture" && resp.contains("params")) {
+                            const bool active = resp["params"].value("active", false);
+                            const std::string app = resp["params"].value("app", "");
+                            g_vision_active.store(active);
+                            {
+                                std::lock_guard<std::mutex> lock(g_vision_mutex);
+                                g_vision_app = std::wstring(app.begin(), app.end());
+                            }
+                            if (g_hwnd) {
+                                InvalidateRect(g_hwnd, nullptr, TRUE);
+                            }
                         }
                     }
                 }
@@ -457,7 +477,31 @@ void VadWorkerLoop() {
             } else {
                 g_aec.ProcessFrame(mic_block, ref_block, clean_block, is_speaking);
                 g_clean_ring_buffer.PushBatch(clean_block, 160);
+
+                // Run real-time acoustic lag auto-calibration on non-MMCSS VadWorkerLoop thread
+                const bool is_double_talk = g_aec.IsDoubleTalk();
+                g_delay_estimator.UpdateFrame(mic_block, ref_block, is_speaking, is_double_talk);
+
+                size_t new_bulk = 0;
+                float delay_ms = 0.0f;
+                float peak_ncc = 0.0f;
+                if (g_delay_estimator.CheckAndClearJustLocked(&new_bulk, &delay_ms, &peak_ncc)) {
+                    g_aec.SetBulkDelaySamples(new_bulk);
+                    std::cout << "[AecCalibrator] Locked acoustic delay: "
+                              << std::fixed << std::setprecision(1) << delay_ms
+                              << " ms (bulk_delay=" << new_bulk
+                              << " samples, NCC=" << std::setprecision(2) << peak_ncc << ")" << std::endl;
+                }
             }
+        }
+
+        // Automatic recalibration on device hot-swap or discontinuity burst
+        static uint64_t s_last_discontinuity = 0;
+        const uint64_t current_discontinuity = g_capture ? g_capture->DiscontinuityCount() : 0;
+        if (current_discontinuity > s_last_discontinuity) {
+            s_last_discontinuity = current_discontinuity;
+            g_delay_estimator.Reset();
+            g_aec.Reset();
         }
 
         // 2. Feed clean ring buffer to Silero VAD
@@ -931,6 +975,15 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     DrawTextW(hdc, g_hud_label.c_str(), -1, &text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                 }
 
+                // Render Purple Vision Dot Indicator if Active Window OCR/Vision is Running
+                if (g_vision_active.load()) {
+                    COLORREF vis_color = RGB(168, 85, 247); // Vivid Purple
+                    HBRUSH vis_brush = CreateSolidBrush(vis_color);
+                    SelectObject(hdc, vis_brush);
+                    Ellipse(hdc, rc.right - 50, (rc.bottom - 8) / 2, rc.right - 42, (rc.bottom + 8) / 2);
+                    DeleteObject(vis_brush);
+                }
+
                 // Render Stop / Pause / Resume Button on Right Edge of Pill
                 RECT stop_btn_rc{rc.right - 32, rc.top + 9, rc.right - 9, rc.bottom - 9};
                 const bool paused = g_is_paused.load();
@@ -976,6 +1029,15 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             };
             SendIpcJson(shutdown_msg);
 
+            // Log host edge latency summary on graceful shutdown
+            auto summary = g_latency_tracker.GetSummary();
+            std::cout << "[Host Latency Summary] Total Turns: " << summary.total_completed_turns
+                      << " | VAD->STT p50=" << summary.vad_to_stt.p50_ms << "ms p95=" << summary.vad_to_stt.p95_ms << "ms"
+                      << " | STT->IPC p50=" << summary.stt_to_ipc.p50_ms << "ms p95=" << summary.stt_to_ipc.p95_ms << "ms"
+                      << " | IPC->Audio p50=" << summary.ipc_to_first_audio.p50_ms << "ms p95=" << summary.ipc_to_first_audio.p95_ms << "ms"
+                      << " | TTFA p50=" << summary.end_to_end_ttfa.p50_ms << "ms p95=" << summary.end_to_end_ttfa.p95_ms << "ms"
+                      << std::endl;
+
             // Wait up to 2000 ms for daemon to cleanly flush SQLite WAL and exit
             if (g_daemon_process) {
                 WaitForSingleObject(g_daemon_process, 2000);
@@ -1016,6 +1078,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
         LocalFree(argv);
     }
 
+    std::filesystem::path crash_dir;
+    if (!g_custom_data_dir.empty()) {
+        crash_dir = std::filesystem::path(g_custom_data_dir) / L"logs" / L"crashes";
+    } else {
+        wchar_t local_app_data[MAX_PATH]{};
+        GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
+        crash_dir = std::filesystem::path(local_app_data) / L"Better_Jarvis" / L"logs" / L"crashes";
+    }
+    jarvis::diagnostics::InitCrashHandler(crash_dir.wstring());
+
     if (!no_daemon) {
         SpawnDaemonInJob();
     }
@@ -1050,13 +1122,38 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
     g_hotkey->SetTargetHwnd(g_hwnd, WM_APP_TRIGGER_SPEAK, WM_APP_RELEASE_SPEAK);
     g_hotkey->Start();
 
+    // Configure host latency telemetry output path
+    std::filesystem::path logs_dir;
+    if (!g_custom_data_dir.empty()) {
+        logs_dir = std::filesystem::path(g_custom_data_dir) / L"logs";
+    } else {
+        wchar_t local_app_data[MAX_PATH]{};
+        GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
+        logs_dir = std::filesystem::path(local_app_data) / L"Better_Jarvis" / L"logs";
+    }
+    std::filesystem::path host_metrics_file = logs_dir / L"host_latency_metrics.jsonl";
+    g_latency_tracker.SetLogFilePath(host_metrics_file.wstring());
+
     // Initialize Audio Pipeline
     g_capture = std::make_unique<jarvis::audio::WasapiCapture>(g_raw_mic_buffer);
 
-    // Model paths from LocalAppData
-    wchar_t local_app_data[MAX_PATH]{};
-    GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
-    std::filesystem::path models_dir = std::filesystem::path(local_app_data) / L"Better_Jarvis" / L"models";
+    // Model paths: check custom data dir, exe dir models, local models dir, or LocalAppData
+    std::filesystem::path models_dir;
+    wchar_t exe_path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+    std::filesystem::path exe_dir = std::filesystem::path(exe_path).parent_path();
+
+    if (!g_custom_data_dir.empty() && std::filesystem::exists(std::filesystem::path(g_custom_data_dir) / L"models")) {
+        models_dir = std::filesystem::path(g_custom_data_dir) / L"models";
+    } else if (std::filesystem::exists(exe_dir / L"models" / L"silero_vad.onnx")) {
+        models_dir = exe_dir / L"models";
+    } else if (std::filesystem::exists("models/silero_vad.onnx")) {
+        models_dir = "models";
+    } else {
+        wchar_t local_app_data[MAX_PATH]{};
+        GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
+        models_dir = std::filesystem::path(local_app_data) / L"Better_Jarvis" / L"models";
+    }
     std::filesystem::path vad_model = models_dir / L"silero_vad.onnx";
     std::filesystem::path whisper_model = models_dir / L"ggml-base.en.bin";
     std::filesystem::path piper_model = models_dir / L"en_US-ryan-medium.onnx";
@@ -1085,8 +1182,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
             g_active_turn_id.store(turn_id, std::memory_order_release);
             g_latency_tracker.RecordVadEnd(turn_id);
 
-            // Forward 16-bit PCM to daemon for Gemini neural transcription
-            if (!pcm.empty()) {
+            if (g_stt && g_stt->IsModelLoaded()) {
+                // Pass directly to local on-device Whisper STT engine
+                g_stt->EnqueueUtterance(std::move(pcm));
+            } else if (!pcm.empty()) {
+                // Fallback to sending 16-bit PCM over IPC to daemon for cloud Gemini transcription
                 std::vector<int16_t> pcm16(pcm.size());
                 for (size_t i = 0; i < pcm.size(); ++i) {
                     float s = std::clamp(pcm[i], -1.0f, 1.0f);
@@ -1113,27 +1213,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
                 EnqueueIpcFrame(std::move(eof_frame));
                 g_latency_tracker.RecordIpcTx(turn_id);
             }
-
-            if (g_stt) {
-                g_stt->EnqueueUtterance(std::move(pcm));
-            }
         }
     });
 
     // Wire STT transcription callback into Named Pipe IPC emission
     g_stt->SetTranscriptionCallback([](const std::string& text, uint64_t duration_ms) {
         if (g_is_paused.load()) return;
-        g_latency_tracker.RecordSttDone(g_active_turn_id.load(std::memory_order_relaxed));
+        const uint32_t turn_id = g_active_turn_id.load(std::memory_order_relaxed);
+        g_latency_tracker.RecordSttDone(turn_id);
 
         json notify = {
             {"jsonrpc", "2.0"},
             {"method", "speech.transcribed"},
             {"params", {
                 {"text", text},
-                {"duration_ms", duration_ms}
+                {"duration_ms", duration_ms},
+                {"turn_id", turn_id}
             }}
         };
-        SendIpcJson(notify);
+        auto frame = jarvis::ipc::EncodeFrame(jarvis::ipc::kMsgTypeControlJson, notify.dump(), turn_id);
+        EnqueueIpcFrame(std::move(frame));
+        g_latency_tracker.RecordIpcTx(turn_id);
 
         if (g_hwnd) {
             std::wstring wtext(text.begin(), text.end());

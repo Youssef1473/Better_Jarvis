@@ -416,21 +416,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_guarded_command_timeout_termination() {
-        // Run benign ping.exe 127.0.0.1 -n 10 via the raw Job-Object runner with 1 second timeout
+        // Run benign sleep command via the raw Job-Object runner with 1 second timeout
         let job = JobObjectGuard::new(Some(1024 * 1024 * 1024)).expect("job created");
-        let mut cmd = tokio::process::Command::new("ping.exe");
-        cmd.args(["127.0.0.1", "-n", "10"])
+        let mut py_cmd = tokio::process::Command::new("python.exe");
+        py_cmd.args(["-c", "import time; time.sleep(10)"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let child = cmd.spawn().expect("ping spawned");
+        let child = match py_cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => {
+                let mut ping_cmd = tokio::process::Command::new("ping.exe");
+                ping_cmd.args(["127.0.0.1", "-n", "10"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                ping_cmd.spawn().expect("ping spawned")
+            }
+        };
+
         if let Some(raw_handle) = child.raw_handle() {
             unsafe { job.assign_process(raw_handle).expect("assigned"); }
         }
 
         let timeout_res = tokio::time::timeout(Duration::from_secs(1), child.wait_with_output()).await;
-        assert!(timeout_res.is_err(), "Ping command did not timeout as expected");
+        assert!(timeout_res.is_err(), "Command did not timeout as expected");
         drop(job); // Forces kill on timeout
     }
 

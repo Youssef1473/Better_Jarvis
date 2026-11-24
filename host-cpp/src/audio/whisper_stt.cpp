@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <iostream>
 #include <sstream>
+#include <windows.h>
 
 #ifdef JARVIS_HAS_WHISPER
 #include <whisper.h>
+#include <ggml-backend.h>
 #endif
 
 namespace jarvis::audio {
@@ -53,6 +56,17 @@ bool WhisperStt::LoadModel(const std::string& model_path) {
     if (model_path.empty()) return false;
 
 #ifdef JARVIS_HAS_WHISPER
+    static std::once_flag s_ggml_backend_init;
+    std::call_once(s_ggml_backend_init, []() {
+        wchar_t self_path[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, self_path, MAX_PATH);
+        std::filesystem::path exe_dir = std::filesystem::path(self_path).parent_path();
+        ggml_backend_load_all_from_path(exe_dir.string().c_str());
+        if (std::filesystem::exists("C:/msys64/ucrt64/bin")) {
+            ggml_backend_load_all_from_path("C:/msys64/ucrt64/bin");
+        }
+    });
+
     struct whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = false; // CPU execution on Alder Lake P-cores
 
@@ -132,6 +146,11 @@ void WhisperStt::WorkerLoop() {
             }
         }
     }
+}
+
+std::string WhisperStt::Transcribe(const std::vector<float>& pcm_16k) {
+    std::string raw = TranscribeInternal(pcm_16k);
+    return SanitizeTranscript(raw);
 }
 
 std::string WhisperStt::TranscribeInternal(const std::vector<float>& pcm_16k) {

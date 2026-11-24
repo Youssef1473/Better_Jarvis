@@ -1,7 +1,9 @@
 #include <cassert>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <vector>
+#include <windows.h>
 
 #include "audio/ring_buffer.hpp"
 #include "audio/silero_vad.hpp"
@@ -122,12 +124,40 @@ void TestMaxUtteranceCap() {
     assert(!vad.IsInSpeech());
 }
 
+void TestRealOnnxVad() {
+    std::filesystem::path model_path;
+    if (std::filesystem::exists("models/silero_vad.onnx")) {
+        model_path = "models/silero_vad.onnx";
+    } else {
+        wchar_t local_app_data[MAX_PATH]{};
+        GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
+        model_path = std::filesystem::path(local_app_data) / L"Better_Jarvis" / L"models" / L"silero_vad.onnx";
+    }
+
+    if (!std::filesystem::exists(model_path)) {
+        std::cout << "[test_vad] silero_vad.onnx not found at " << model_path << ", skipping real model check" << std::endl;
+        return;
+    }
+
+    SpscRingBuffer<32768> ring_buffer;
+    SileroVad vad(ring_buffer, model_path.wstring());
+    assert(vad.IsOnnxLoaded());
+
+    auto silence = GenerateSilenceFrame();
+    for (int i = 0; i < 100; ++i) {
+        float prob = vad.EvaluateFrame(silence.data());
+        assert(prob < 0.15f);
+    }
+    std::cout << "  [test_vad] Real Silero VAD ONNX verified (100 silence frames < 0.15)" << std::endl;
+}
+
 } // namespace
 
 int main() {
     TestSilenceDoesNotTriggerSpeech();
     TestSpeechOnsetPreRollAndEndpointing();
     TestMaxUtteranceCap();
+    TestRealOnnxVad();
     std::cout << "All SileroVad tests PASSED!" << std::endl;
     return 0;
 }

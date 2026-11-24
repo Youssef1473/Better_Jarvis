@@ -1,7 +1,10 @@
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <vector>
+#include <windows.h>
 
 #include "audio/piper_tts.hpp"
 
@@ -37,9 +40,47 @@ void TestBargeInEpochIncrement() {
     assert(tts.CurrentEpoch() == 2);
 }
 
+void TestRealPiperSynthesis() {
+    std::filesystem::path model_path;
+    std::filesystem::path config_path;
+    if (std::filesystem::exists("models/en_US-ryan-medium.onnx")) {
+        model_path = "models/en_US-ryan-medium.onnx";
+        config_path = "models/en_US-ryan-medium.onnx.json";
+    } else {
+        wchar_t local_app_data[MAX_PATH]{};
+        GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
+        model_path = std::filesystem::path(local_app_data) / L"Better_Jarvis" / L"models" / L"en_US-ryan-medium.onnx";
+        config_path = std::filesystem::path(local_app_data) / L"Better_Jarvis" / L"models" / L"en_US-ryan-medium.onnx.json";
+    }
+
+    if (!std::filesystem::exists(model_path)) {
+        std::cout << "[test_piper_tts] en_US-ryan-medium.onnx not found at " << model_path << ", skipping real model check" << std::endl;
+        return;
+    }
+
+    PiperTts tts(model_path.string(), config_path.string());
+    assert(tts.IsModelLoaded());
+
+    std::vector<float> pcm;
+    bool ok = tts.Synthesize("Hello, systems online.", pcm);
+    assert(ok);
+    assert(pcm.size() > 10000);
+    std::cout << "  [test_piper_tts] Real Piper synthesis generated " << pcm.size()
+              << " samples @ 22050 Hz (> 10000, non-chime)" << std::endl;
+
+    // Verify sub-20ms StopPlayback() interruptibility
+    auto t0 = std::chrono::high_resolution_clock::now();
+    tts.StopPlayback();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    auto stop_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    assert(stop_us < 20000); // Must halt under 20ms
+    std::cout << "  [test_piper_tts] StopPlayback completed in " << stop_us << " us (< 20 ms)" << std::endl;
+}
+
 int main() {
     TestUpsample22kTo48kStereo();
     TestBargeInEpochIncrement();
+    TestRealPiperSynthesis();
     std::cout << "All PiperTts tests PASSED!" << std::endl;
     return 0;
 }

@@ -17,5 +17,9 @@ models/
 *.bin
 *.onnx
 
+# Release artifacts
+/dist/
+scripts/__pycache__/
+
 # Agent Scratch & Local Skills
 .agents/

@@ -13,6 +13,16 @@ void AecProcessor::Reset() noexcept {
     write_idx_ = 0;
     erle_db_ = 0.0f;
     is_double_talk_ = false;
+    max_ref_energy_ = 0.0f;
+}
+
+void AecProcessor::SetBulkDelaySamples(size_t delay_samples) noexcept {
+    const size_t clamped = std::clamp(delay_samples, size_t{0}, size_t{3200});
+    const size_t shift = (clamped > bulk_delay_) ? (clamped - bulk_delay_) : (bulk_delay_ - clamped);
+    bulk_delay_ = clamped;
+    if (shift > 32) {
+        std::fill(weights_.begin(), weights_.end(), 0.0f);
+    }
 }
 
 void AecProcessor::ProcessFrame(
@@ -36,10 +46,12 @@ void AecProcessor::ProcessFrame(
     }
 
     // Double-Talk Detection (DTD):
-    // In typical desktop acoustics, acoustic coupling is < 0.85 (echo is quieter than speaker output).
-    // If mic energy exceeds reference energy significantly, near-end human voice is dominant.
-    if (ref_energy > 1e-4f) {
-        if (mic_energy > 0.85f * ref_energy) {
+    // In typical desktop acoustics, acoustic coupling is < 0.85 (echo is quieter than peak speaker output).
+    // Using a peak envelope over recent reference history (Geigel DTD principle),
+    // if mic energy exceeds 0.85 * max_ref_energy_, near-end human voice is dominant.
+    max_ref_energy_ = std::max(ref_energy, max_ref_energy_ * 0.95f);
+    if (max_ref_energy_ > 1e-4f) {
+        if (mic_energy > 0.85f * max_ref_energy_) {
             is_double_talk_ = true;
         } else {
             is_double_talk_ = false;

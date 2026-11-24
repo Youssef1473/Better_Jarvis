@@ -20,9 +20,11 @@ struct SileroVad::OnnxImpl {
 
     OnnxImpl(const std::wstring& model_path) {
         session_options.SetIntraOpNumThreads(1);
+        session_options.SetInterOpNumThreads(1);
         session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         try {
             session = std::make_unique<Ort::Session>(env, model_path.c_str(), session_options);
+            std::wcout << L"[SileroVad] Loaded real ONNX model: " << model_path << std::endl;
         } catch (const std::exception& ex) {
             std::cerr << "[SileroVad] Failed to load ONNX model: " << ex.what() << std::endl;
         }

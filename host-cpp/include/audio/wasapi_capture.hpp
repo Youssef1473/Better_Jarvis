@@ -73,6 +73,11 @@ public:
         return os_aec_active_.load(std::memory_order_relaxed);
     }
 
+    /// Telemetry: active negotiated WASAPI shared-mode engine period in milliseconds.
+    float NegotiatedPeriodMs() const noexcept {
+        return negotiated_period_ms_.load(std::memory_order_relaxed);
+    }
+
 private:
     void CaptureThreadLoop();
 
@@ -121,9 +126,10 @@ private:
     std::vector<float> mono_scratch_;
     std::vector<float> resample_scratch_;
 
-    // Telemetry: audio data discontinuities and OS AEC status
+    // Telemetry: audio data discontinuities, OS AEC status, and negotiated period
     alignas(64) std::atomic<uint64_t> discontinuity_count_{0};
     alignas(64) std::atomic<bool>     os_aec_active_{false};
+    alignas(64) std::atomic<float>    negotiated_period_ms_{10.0f};
 
     // Hot-swap notification client
     AudioDeviceNotifier* notifier_{nullptr};

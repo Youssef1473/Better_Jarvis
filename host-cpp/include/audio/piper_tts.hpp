@@ -46,6 +46,10 @@ public:
     /// Synthesizes text and enqueues audio for real-time chunked playback under the current epoch.
     void Speak(const std::string& text);
 
+    /// Synthesizes text directly to PCM 22050 Hz mono float buffer without starting WASAPI playback.
+    /// Useful for testing, offline synthesis, or caching.
+    bool Synthesize(const std::string& text, std::vector<float>& pcm_out);
+
     /// Sub-20 ms Barge-In / Stop: advances speech epoch, flushes pending audio chunks,
     /// resets the WASAPI render client buffer, clears the reference buffer, and returns immediately (< 20 ms).
     void StopPlayback() noexcept;

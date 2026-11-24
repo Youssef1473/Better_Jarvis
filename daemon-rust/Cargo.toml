@@ -15,3 +15,21 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "=0.1.9"
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["load-dynamic", "std", "ndarray"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+ndarray = "0.16"
+windows = { version = "0.58", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_WinRT",
+    "Win32_Security",
+    "Storage_Streams",
+] }

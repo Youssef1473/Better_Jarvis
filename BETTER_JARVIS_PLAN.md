@@ -145,3 +145,66 @@
   2. Implement mandatory supply-chain model pinning via `manifest.sha256` and enforce cryptographic SHA-256 validation in `scripts/verify-beta.ps1` and `scripts/setup-models.ps1`.
   3. Upgrade verification suite `scripts/verify-beta.ps1` with isolated temporary smoke directory, true host `taskkill /F` Job Object cascade termination asserting zero orphan daemons, and WAL integrity check on the killed smoke database.
 - **Exit Gate**: 100% pass across all 5 verification phases of `scripts/verify-beta.ps1` with zero mutations to the user's live profile.
+
+---
+
+## Phase 3: v1.0 Production Architecture & Native Neural Inference
+
+### TICKET-12: Native Neural Inference Integration & Host Telemetry Persistence
+- **Objective**: Replace build-safe stubs with true on-device neural inference across VAD, STT, and TTS; persist host QPC latency metrics.
+- **Tasks**:
+  1. Link native UCRT64 `onnxruntime`, `whisper.cpp`, and `espeak-ng` in `host-cpp/CMakeLists.txt` and define `JARVIS_HAS_ONNXRUNTIME=1`, `JARVIS_HAS_WHISPER=1`, `JARVIS_HAS_PIPER=1` unconditionally for Release builds.
+  2. Wire `silero_vad.cpp` to run `models/silero_vad.onnx` via `Ort::Session` on CPU with dynamic tensor shape verification and real speech probability evaluation.
+  3. Wire `whisper_stt.cpp` to run `models/ggml-base.en.bin` via `whisper.cpp` (bounded to 4 CPU threads, modular ggml backends), transcribe post-AEC utterances locally, and send `speech.transcribed` JSON-RPC over IPC.
+  4. Wire `piper_tts.cpp` to phonemize text via `espeak-ng` and synthesize neural audio via `Ort::Session` on `models/en_US-ryan-medium.onnx` + `.json`, feeding WASAPI render and far-end AEC reference buffer with interruptible sub-20ms epoch abort.
+  5. Asynchronously persist host QPC edge timings (`vad_to_stt_ms`, `stt_to_ipc_ms`, `ipc_to_first_audio_ms`, `end_to_end_ttfa_ms`) to `<data_dir>\logs\host_latency_metrics.jsonl`.
+- **Exit Gate**: Real ONNX/Whisper/Piper inference runs locally with live weights, zero stub banners appear in Release runtime, and all 9 C++ test suites + 96 Rust tests pass.
+
+### TICKET-13: Dynamic AEC Acoustic Delay Auto-Calibration & Audio Tuning
+- **Objective**: Dynamically determine physical DAC-to-ADC acoustic echo delay per-device, expand reference history, auto-calibrate NLMS filter delay, and probe opportunistic `IAudioClient3` low-latency periods.
+- **Tasks**:
+  1. Expand AEC reference history window from 2,048 (128 ms) to 4,096 (256 ms @ 16 kHz) with `SetBulkDelaySamples` dynamically clamped to `[0, 3200]`, auto-zeroing NLMS weights if shift exceeds 32 samples (2 ms).
+  2. Implement zero-allocation `AecDelayEstimator` running on non-MMCSS `VadWorkerLoop` using 4x decimated Normalized Cross-Correlation (NCC) across `[0, 200 ms]` evaluated every 200 ms, with 3-consecutive estimate hysteresis lock, 4 ms (64-sample) causal safety lead, and device hot-swap auto-recalibration.
+  3. Probe opportunistic Windows 11 `IAudioClient3::InitializeSharedAudioStream` in `WasapiCapture` with `min_period` clamped to `>= 2 ms` floor, seamlessly falling back to `IAudioClient::Initialize` on unsupported configurations.
+  4. Expand `host-cpp/tests/test_aec.cpp` with multi-delay auto-calibration convergence (15 ms, 55 ms, 120 ms; ERLE >= 12 dB), double-talk lock preservation, simulated hot-swap recalibration (20 ms -> 95 ms), and CPU budget (< 0.5 ms per 10 ms frame).
+- **Exit Gate**: `scripts/verify-beta.ps1` passes all 5 gates with 100% green tests across Rust and C++, showing sub-0.5ms frame timing and >= 12 dB ERLE across all delays.
+
+### TICKET-14: Local Semantic Memory via sqlite-vec & Local Embeddings
+- **Objective**: Embed `sqlite-vec` extension and local ONNX embedding model for sub-5ms local fact recall, hybrid Reciprocal Rank Fusion, and stored prompt-injection defense.
+- **Tasks**:
+  1. Provision `all-MiniLM-L6-v2-q8.onnx` (23.0 MB) and `all-MiniLM-L6-v2-tokenizer.json` (711 KB) pinned in `manifest.sha256` and automated in `scripts/setup-models.ps1`.
+  2. Implement `LocalEmbedder` on dedicated background thread `jarvis-embed-actor` with bounded channel (`capacity = 32`), dynamic `onnxruntime.dll` loading with System32 collision avoidance, tokenization, mean pooling over non-padded tokens, and unit L2 normalization to `[f32; 384]`.
+  3. Register `sqlite-vec` static extension across all SQLite connections via `sqlite3_auto_extension`. Create virtual tables `notes_vec` and `facts_vec` using `vec0(embedding float[384] distance_metric=cosine)`, and `notes_fts` using `fts5`.
+  4. Implement hybrid Reciprocal Rank Fusion (`hybrid_search_memory`) merging `sqlite-vec` cosine KNN and FTS5 BM25 with $k = 60$.
+  5. Enforce Stored Prompt-Injection Defense: track `source_trusted` provenance across facts and notes; query-scoped recall in `retrieve_context_for_turn` wraps untrusted notes in active per-turn CNG nonce delimiters and immediately triggers `TurnTaintState::mark_tainted("memory:untrusted_note")` for dynamic model escalation and Tier 3 mutation gates. Expose `search_memory` tool for explicit queries.
+- **Exit Gate**: `scripts/verify-beta.ps1` passes all 5 gates (101/101 Rust tests, 0 Clippy warnings under `-D warnings`, 9/9 C++ test suites, and live binary smoke tests).
+
+### TICKET-15: Windows Visual Context & Desktop OCR
+- **Objective**: Integrate active window inspection and Windows OCR for multimodal desktop grounding with fail-closed privacy guards and prompt injection defenses.
+- **Implementation**:
+  1. Implemented `VisionPrivacyGuard` in `daemon-rust/src/tools/screen_vision.rs` hard-rejecting password managers (`1password`, `bitwarden`, `keepass`, `keepassxc`, `lastpass`, `dashlane`, `enpass`, `protonpass`, `credentialuibroker`, `consent`, `lockapp`, `logonui`, `taskmgr`, `mmc`), sensitive window title substrings (`inprivate`, `incognito`, `password`, `vault`, `sign in`, `2fa`, `bank`, `credit card`, etc.), non-zero display affinity (`WDA_MONITOR`, `WDA_EXCLUDEFROMCAPTURE`), and self (`jarvis-host`, `jarvis-daemon`) via Z-order walking.
+  2. Built in-memory active-window capture using Win32 GDI `PrintWindow` with `PW_RENDERFULLCONTENT` to 32-bit BGRA bytes with zero disk writes.
+  3. Integrated Windows WinRT `Windows.Media.Ocr.OcrEngine` via Microsoft `windows` crate (v0.58) transferring BGRA bytes directly to in-memory `SoftwareBitmap` via `DataWriter` / `IBuffer`, with text extraction and 16 KiB UTF-8 truncation (`truncate_utf8_16kib`).
+  4. Added `VisionHudGuard` sending `hud.vision_capture` (`active: true`/`false`) via Named Pipe to `host-cpp/src/main.cpp`, rendering a glowing purple vision indicator dot on the HUD pill.
+  5. Wired agent tools `inspect_active_window` and `read_active_window_ocr` in `gemini_client.rs`, wrapping outputs in active turn cryptographic CNG nonces and setting `TurnTaintState::mark_tainted` (`"vision:window_title"`, `"vision:ocr"`), automatically routing next turn to `cloud_heavy` and escalating all state mutations to Tier 3 Amber user confirmation.
+  6. Closed Step 0 Polish: configured `ort` session with 2 intra-op threads, 1 inter-op thread, startup arena warmup (slashing warm embedding latency from 134.52 ms to 11.74 ms), and serialized `memory_recall_ms` to `latency_metrics.jsonl`.
+- **Exit Gate**: `scripts/verify-beta.ps1` passes all 5 gates (106/106 Rust tests, 0 Clippy warnings under `-D warnings`, 9/9 C++ test suites, and live binary smoke tests with 4 resident neural models at 448.4 MB total RAM).
+
+### TICKET-16: Production Distribution, Standalone Packaging & Zero-Telemetry Diagnostics
+- **Objective**: Produce standalone zero-dependency distribution layout with zero-telemetry crash minidumps, panic logging, Task Scheduler autostart, and clean-PATH verification.
+- **Implementation**:
+  1. Implemented native C++ crash handler in `host-cpp/include/diagnostics/crash_handler.hpp` and `host-cpp/src/diagnostics/crash_handler.cpp` writing `MDMP` minidumps via `MiniDumpWriteDump` (`MiniDumpNormal | MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules`) to `<data_dir>\logs\crashes` with strict 5-file FIFO rotation and zero telemetry upload.
+  2. Implemented Rust daemon panic hook in `daemon-rust/src/diagnostics.rs` intercepting panics, scrubbing API keys/bearer tokens/nonces, writing formatted crash logs, and pruning to 5 files.
+  3. Created `scripts/package-release.ps1` staging standalone distribution layout in `dist/Better_Jarvis-v1.0.0-win64/` with stripped binaries, all 27 runtime DLLs, `espeak-ng-data`, configs, and BOM-free `dist/SHA256SUMS.txt`. Output: `dist/Better_Jarvis-v1.0.0-win64.zip` (59.16 MB).
+  4. Authored installer manifests `packaging/better_jarvis.iss` (`PrivilegesRequired=lowest`) and `packaging/better_jarvis.wxs` (`Scope="perUser"`), plus `scripts/install-startup.ps1` (`-RunLevel Limited`) and `scripts/uninstall-startup.ps1`.
+  5. Implemented `scripts/run-desktop.py` binding `winsta0\default` window station for zero-`0xC0000142` test and process supervision execution.
+  6. Implemented `scripts/verify-v1.ps1` verifying all 6 production gates.
+
+### TICKET-16.1: P0 Least-Privilege Hotfix & Hygiene
+- **Objective**: Guarantee zero privilege elevation on user logon autostart, enforce strict static audit gates, and clean repo hygiene.
+- **Tasks**:
+  1. Enforce strict `RunLevel = Limited` (Medium Integrity Level) in `scripts/install-startup.ps1` and verify zero elevation in `packaging/better_jarvis.iss` and `packaging/better_jarvis.wxs`.
+  2. Add static gate in `scripts/verify-v1.ps1` Phase [2/6] failing on any occurrence of `HighestAvailable`, `-RunLevel Highest`, or `PrivilegesRequired=admin`.
+  3. Add `dist/` and `scripts/__pycache__/` to `.gitignore`. Remove unneeded `scripts/run-cargo.py`.
+  4. Verify Rust panic secret-scrubbing test `diagnostics::tests::test_secret_scrubbing`.
+- **Exit Gate**: `scripts/verify-v1.ps1` passes all 6 production gates end-to-end.
