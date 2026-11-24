@@ -65,6 +65,7 @@ public:
     VadState State() const noexcept { return state_; }
     bool IsInSpeech() const noexcept { return state_ == VadState::kSpeech; }
     bool IsOnnxLoaded() const noexcept { return is_onnx_loaded_; }
+    float LastProbability() const noexcept { return last_prob_; }
 
 private:
     float EvaluateOnnx(const float* frame_512);
@@ -88,6 +89,7 @@ private:
 
     // Fallback RMS energy detector state
     float noise_floor_{0.005f};
+    float last_prob_{0.0f};
 
     // Opaque pointer to ONNX Runtime session implementation
     struct OnnxImpl;

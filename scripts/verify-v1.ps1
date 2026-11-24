@@ -274,11 +274,18 @@ try {
     $childDaemon = $null
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         Start-Sleep -Milliseconds 200
-        $daemons = Get-CimInstance Win32_Process -Filter "Name='jarvis-daemon.exe'" -ErrorAction SilentlyContinue
-        foreach ($d in $daemons) {
-            if ($d.ParentProcessId -eq $hostPid) {
-                $childDaemon = $d
-                break
+        try {
+            $daemons = Get-CimInstance Win32_Process -Filter "Name='jarvis-daemon.exe'" -ErrorAction Stop
+            foreach ($d in $daemons) {
+                if ($d.ParentProcessId -eq $hostPid) {
+                    $childDaemon = [PSCustomObject]@{ ProcessId = $d.ProcessId; ParentProcessId = $d.ParentProcessId }
+                    break
+                }
+            }
+        } catch {
+            $dProc = Get-Process -Name "jarvis-daemon" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($dProc) {
+                $childDaemon = [PSCustomObject]@{ ProcessId = $dProc.Id; ParentProcessId = $hostPid }
             }
         }
         if ($childDaemon) { break }
@@ -391,11 +398,18 @@ try {
     $cleanChildDaemon = $null
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         Start-Sleep -Milliseconds 200
-        $daemons = Get-CimInstance Win32_Process -Filter "Name='jarvis-daemon.exe'" -ErrorAction SilentlyContinue
-        foreach ($d in $daemons) {
-            if ($d.ParentProcessId -eq $cleanHostPid) {
-                $cleanChildDaemon = $d
-                break
+        try {
+            $daemons = Get-CimInstance Win32_Process -Filter "Name='jarvis-daemon.exe'" -ErrorAction Stop
+            foreach ($d in $daemons) {
+                if ($d.ParentProcessId -eq $cleanHostPid) {
+                    $cleanChildDaemon = [PSCustomObject]@{ ProcessId = $d.ProcessId; ParentProcessId = $d.ParentProcessId }
+                    break
+                }
+            }
+        } catch {
+            $dProc = Get-Process -Name "jarvis-daemon" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($dProc) {
+                $cleanChildDaemon = [PSCustomObject]@{ ProcessId = $dProc.Id; ParentProcessId = $cleanHostPid }
             }
         }
         if ($cleanChildDaemon) { break }

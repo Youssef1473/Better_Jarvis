@@ -179,6 +179,7 @@ bool SileroVad::ProcessNextFrame() {
     }
 
     const float prob = EvaluateFrame(frame_scratch_.data());
+    last_prob_ = prob;
 
     const float start_thresh = is_speaking_mode_ ? 0.75f : kStartThreshold;
     const int   min_speech_frames = is_speaking_mode_ ? 3 : kStartMinFrames;

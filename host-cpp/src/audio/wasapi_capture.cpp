@@ -1,13 +1,24 @@
 #include "audio/wasapi_capture.hpp"
 #include "audio/mmcss_guard.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <string>
 
 namespace jarvis::audio {
 
 namespace {
+
+#ifndef PKEY_Device_FriendlyName
+static const PROPERTYKEY PKEY_Device_FriendlyName = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14
+};
+#endif
 
 // Static GUID definition for KSDATAFORMAT_SUBTYPE_IEEE_FLOAT ({00000003-0000-0010-8000-00aa00389b71})
 static const GUID kSubtypeIeeeFloat = {
@@ -157,10 +168,13 @@ private:
     LONG ref_count_{1};
 };
 
-WasapiCapture::WasapiCapture(SpscRingBuffer<32768>& ring_buffer)
+WasapiCapture::WasapiCapture(
+    SpscRingBuffer<32768>& ring_buffer,
+    const std::wstring& target_device)
     : ring_buffer_(ring_buffer),
       mono_scratch_(kMaxScratchSamples, 0.0f),
-      resample_scratch_(kMaxScratchSamples, 0.0f) {
+      resample_scratch_(kMaxScratchSamples, 0.0f),
+      target_device_name_(target_device) {
 }
 
 WasapiCapture::~WasapiCapture() {
@@ -235,13 +249,78 @@ bool WasapiCapture::InitEndpoint(
     *mix_format = nullptr;
 
     IMMDevice* device = nullptr;
-    HRESULT hr = enumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, &device);
-    if (FAILED(hr) || !device) {
-        hr = enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &device);
+    HRESULT hr = S_OK;
+
+    if (target_device_name_.empty() || target_device_name_ == L"default") {
+        hr = enumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, &device);
+        if (FAILED(hr) || !device) {
+            hr = enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &device);
+        }
+    } else {
+        IMMDeviceCollection* collection = nullptr;
+        hr = enumerator->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &collection);
+        if (SUCCEEDED(hr) && collection) {
+            UINT count = 0;
+            collection->GetCount(&count);
+            for (UINT i = 0; i < count; ++i) {
+                IMMDevice* candidate = nullptr;
+                if (SUCCEEDED(collection->Item(i, &candidate)) && candidate) {
+                    IPropertyStore* props = nullptr;
+                    if (SUCCEEDED(candidate->OpenPropertyStore(STGM_READ, &props)) && props) {
+                        PROPVARIANT varName;
+                        PropVariantInit(&varName);
+                        if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &varName)) && varName.pwszVal) {
+                            std::wstring candidate_name = varName.pwszVal;
+                            auto to_lower = [](std::wstring s) {
+                                for (auto& c : s) c = static_cast<wchar_t>(std::tolower(c));
+                                return s;
+                            };
+                            if (to_lower(candidate_name).find(to_lower(target_device_name_)) != std::wstring::npos) {
+                                device = candidate;
+                                device->AddRef();
+                                PropVariantClear(&varName);
+                                props->Release();
+                                candidate->Release();
+                                break;
+                            }
+                        }
+                        PropVariantClear(&varName);
+                        props->Release();
+                    }
+                    candidate->Release();
+                }
+            }
+            collection->Release();
+        }
+        if (!device) {
+            std::wcerr << L"[WasapiCapture] Target device \"" << target_device_name_
+                       << L"\" not found among active capture devices. Falling back to default." << std::endl;
+            hr = enumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, &device);
+            if (FAILED(hr) || !device) {
+                hr = enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &device);
+            }
+        }
     }
+
     if (FAILED(hr) || !device) {
+        std::wcerr << L"[WasapiCapture] Failed to acquire capture device (hr=0x"
+                   << std::hex << hr << std::dec << L")" << std::endl;
         return false;
     }
+
+    // Query endpoint friendly name
+    std::wstring friendly_name = L"Unknown Capture Device";
+    IPropertyStore* dev_props = nullptr;
+    if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &dev_props)) && dev_props) {
+        PROPVARIANT varName;
+        PropVariantInit(&varName);
+        if (SUCCEEDED(dev_props->GetValue(PKEY_Device_FriendlyName, &varName)) && varName.pwszVal) {
+            friendly_name = varName.pwszVal;
+        }
+        PropVariantClear(&varName);
+        dev_props->Release();
+    }
+    active_friendly_name_ = friendly_name;
 
     hr = device->Activate(
         __uuidof(IAudioClient),
@@ -251,6 +330,8 @@ bool WasapiCapture::InitEndpoint(
     device->Release();
 
     if (FAILED(hr) || !*client) {
+        std::wcerr << L"[WasapiCapture] device->Activate(IAudioClient) failed (hr=0x"
+                   << std::hex << hr << std::dec << L")" << std::endl;
         return false;
     }
 
@@ -286,6 +367,9 @@ bool WasapiCapture::InitEndpoint(
     // Opportunistic IAudioClient3 low-latency shared-mode probing
     IAudioClient3* client3 = nullptr;
     bool client3_initialized = false;
+    std::string init_method = "Unknown";
+    HRESULT client_init_hr = S_OK;
+
     if (SUCCEEDED((*client)->QueryInterface(IID_IAudioClient3_Local, reinterpret_cast<void**>(&client3))) && client3) {
         UINT32 def_period = 0, fund_period = 0, min_period = 0, max_period = 0;
         HRESULT period_hr = client3->GetSharedModeEnginePeriod(
@@ -315,6 +399,8 @@ bool WasapiCapture::InitEndpoint(
                     native_channels_ = 1;
                     negotiated_period_ms_.store(static_cast<float>(safe_period) * 1000.0f / 16000.0f, std::memory_order_relaxed);
                     client3_initialized = true;
+                    init_method = "IAudioClient3 (low-latency shared stream)";
+                    client_init_hr = hr;
                 }
             }
         }
@@ -341,6 +427,8 @@ bool WasapiCapture::InitEndpoint(
             native_sample_rate_ = 16000;
             native_channels_ = 1;
             negotiated_period_ms_.store(10.0f, std::memory_order_relaxed);
+            init_method = "IAudioClient::Initialize (16 kHz shared-mode AUTOCONVERTPCM)";
+            client_init_hr = hr;
         } else {
             // Fallback: query native device mix format
             hr = (*client)->GetMixFormat(mix_format);
@@ -369,6 +457,8 @@ bool WasapiCapture::InitEndpoint(
                 return false;
             }
             negotiated_period_ms_.store(10.0f, std::memory_order_relaxed);
+            init_method = "IAudioClient::Initialize (Native device format resampled)";
+            client_init_hr = hr;
         }
     }
 
@@ -408,6 +498,8 @@ bool WasapiCapture::InitEndpoint(
 
     hr = (*client)->Start();
     if (FAILED(hr)) {
+        std::wcerr << L"[WasapiCapture] (*client)->Start() failed (hr=0x"
+                   << std::hex << hr << std::dec << L")" << std::endl;
         (*capture_client)->Release();
         *capture_client = nullptr;
         CoTaskMemFree(*mix_format);
@@ -416,6 +508,20 @@ bool WasapiCapture::InitEndpoint(
         *client = nullptr;
         return false;
     }
+
+    std::wcout << L"[WasapiCapture] InitEndpoint resolved: \"" << active_friendly_name_ << L"\""
+               << L" | Method: " << init_method.c_str()
+               << L" | Format: " << (*mix_format)->nSamplesPerSec << L" Hz, "
+               << (*mix_format)->nChannels << L" ch, "
+               << (*mix_format)->wBitsPerSample << L"-bit"
+               << L" | Period: " << std::fixed << std::setprecision(1) << negotiated_period_ms_.load() << L" ms"
+               << L" | Init HRESULT: 0x" << std::hex << client_init_hr << std::dec;
+    if (client_init_hr == AUDCLNT_E_DEVICE_IN_USE) {
+        std::wcout << L" [AUDCLNT_E_DEVICE_IN_USE]";
+    } else if (client_init_hr == E_ACCESSDENIED) {
+        std::wcout << L" [E_ACCESSDENIED: Mic Privacy Permission]";
+    }
+    std::wcout << std::endl;
 
     return true;
 }

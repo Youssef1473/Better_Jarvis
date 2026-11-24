@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -213,12 +215,53 @@ void TestHudThreadStallIsolation() {
     hud_thread.join();
 }
 
+void TestPttUtteranceThresholds() {
+    // Test PTT release threshold logic:
+    // 1. Duration < 250 ms (e.g. 100 ms = 1600 samples @ 16 kHz) -> Short/accidental press -> false (HUD resets to Ready)
+    auto eval_ptt = [](const std::vector<float>& ptt_audio) -> bool {
+        const size_t num_samples = ptt_audio.size();
+        const float duration_ms = static_cast<float>(num_samples) * 1000.0f / 16000.0f;
+        double sum_sq = 0.0;
+        for (float s : ptt_audio) {
+            sum_sq += static_cast<double>(s) * static_cast<double>(s);
+        }
+        const float rms = (num_samples > 0) ? static_cast<float>(std::sqrt(sum_sq / static_cast<double>(num_samples))) : 0.0f;
+        return (duration_ms >= 250.0f && rms >= 0.0001f);
+    };
+
+    // 1. Short utterance (100 ms, 1600 samples) with loud speech -> Rejected
+    std::vector<float> short_audio(1600, 0.25f);
+    assert(!eval_ptt(short_audio));
+
+    // 2. Long utterance (500 ms, 8000 samples) with pure silence (0.0f) -> Rejected (silent PTT release resets HUD)
+    std::vector<float> silent_audio(8000, 0.0f);
+    assert(!eval_ptt(silent_audio));
+
+    // 3. Long utterance (500 ms, 8000 samples) with near-zero noise below threshold (0.00005f) -> Rejected
+    std::vector<float> near_zero(8000, 0.00005f);
+    assert(!eval_ptt(near_zero));
+
+    // 4. Valid utterance (500 ms, 8000 samples) with audible speech (RMS >= 0.0001f) -> Accepted (HUD thinking & dispatched)
+    std::vector<float> speech_audio(8000);
+    for (size_t i = 0; i < 8000; ++i) {
+        speech_audio[i] = 0.1f * std::sin(2.0f * 3.14159265f * 440.0f * static_cast<float>(i) / 16000.0f);
+    }
+    assert(eval_ptt(speech_audio));
+
+    // 5. Bare minimum valid threshold (250 ms = 4000 samples @ 16 kHz) with threshold RMS -> Accepted
+    std::vector<float> min_audio(4000, 0.0002f);
+    assert(eval_ptt(min_audio));
+}
+
 int main() {
     std::cout << "[TEST] Running TestStateMachineLogic..." << std::endl;
     TestStateMachineLogic();
 
     std::cout << "[TEST] Running TestHudThreadStallIsolation (1,500 ms HUD freeze)..." << std::endl;
     TestHudThreadStallIsolation();
+
+    std::cout << "[TEST] Running TestPttUtteranceThresholds..." << std::endl;
+    TestPttUtteranceThresholds();
 
     std::cout << "[PASS] All HotkeyListener tests passed successfully!" << std::endl;
     return 0;

@@ -33,7 +33,9 @@ class WasapiCapture {
 public:
     static constexpr size_t kMaxScratchSamples = 65536;
 
-    explicit WasapiCapture(SpscRingBuffer<32768>& ring_buffer);
+    explicit WasapiCapture(
+        SpscRingBuffer<32768>& ring_buffer,
+        const std::wstring& target_device = L"default");
     ~WasapiCapture();
 
     // Non-copyable, non-movable
@@ -45,6 +47,19 @@ public:
 
     /// Stops capture and waits for the thread to exit cleanly.
     void Stop();
+
+    /// Sets or updates the target audio capture device name (supports case-insensitive substring match).
+    void SetTargetDeviceName(const std::wstring& target_device) {
+        target_device_name_ = target_device;
+    }
+    const std::wstring& TargetDeviceName() const noexcept {
+        return target_device_name_;
+    }
+
+    /// Resolved friendly name of the active capture endpoint.
+    std::wstring ActiveDeviceFriendlyName() const {
+        return active_friendly_name_;
+    }
 
     /// True if the capture thread is currently running and active.
     bool IsRunning() const noexcept { return running_.load(std::memory_order_relaxed); }
@@ -134,6 +149,10 @@ private:
     // Hot-swap notification client
     AudioDeviceNotifier* notifier_{nullptr};
     IMMDeviceEnumerator* enumerator_{nullptr};
+
+    // Target and resolved device names
+    std::wstring target_device_name_{L"default"};
+    std::wstring active_friendly_name_{L"Default Communications/Console"};
 };
 
 } // namespace jarvis::audio

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -79,6 +80,12 @@ std::wstring          g_confirm_command;
 std::atomic<bool>     g_vision_active{false};
 std::mutex            g_vision_mutex;
 std::wstring          g_vision_app;
+
+// Push-to-Talk and Listening Watchdog State
+std::atomic<bool>     g_ptt_active{false};
+std::mutex            g_ptt_mutex;
+std::vector<float>    g_ptt_audio_buffer;
+std::chrono::steady_clock::time_point g_listening_start_time = std::chrono::steady_clock::now();
 
 // Audio Subsystems
 jarvis::audio::SpscRingBuffer<32768>           g_raw_mic_buffer;
@@ -474,9 +481,21 @@ void VadWorkerLoop() {
             if (os_aec_active) {
                 // Prevent double-AEC: Windows 11 hardware/driver already cancels echo
                 g_clean_ring_buffer.PushBatch(mic_block, 160);
+                if (g_ptt_active.load(std::memory_order_relaxed)) {
+                    std::lock_guard<std::mutex> lock(g_ptt_mutex);
+                    if (g_ptt_audio_buffer.size() < 240000) {
+                        g_ptt_audio_buffer.insert(g_ptt_audio_buffer.end(), mic_block, mic_block + 160);
+                    }
+                }
             } else {
                 g_aec.ProcessFrame(mic_block, ref_block, clean_block, is_speaking);
                 g_clean_ring_buffer.PushBatch(clean_block, 160);
+                if (g_ptt_active.load(std::memory_order_relaxed)) {
+                    std::lock_guard<std::mutex> lock(g_ptt_mutex);
+                    if (g_ptt_audio_buffer.size() < 240000) {
+                        g_ptt_audio_buffer.insert(g_ptt_audio_buffer.end(), clean_block, clean_block + 160);
+                    }
+                }
 
                 // Run real-time acoustic lag auto-calibration on non-MMCSS VadWorkerLoop thread
                 const bool is_double_talk = g_aec.IsDoubleTalk();
@@ -547,6 +566,7 @@ void VadWorkerLoop() {
                         PostMessageW(g_hwnd, WM_APP_SPEECH, 0, 0);
                     }
                 } else if (g_hud_state.load() != HudState::Listening && g_hud_state.load() != HudState::Confirmation) {
+                    g_listening_start_time = std::chrono::steady_clock::now();
                     g_hud_state.store(HudState::Listening);
                     g_hud_label = L"JARVIS // LISTENING...";
                     if (g_hwnd) {
@@ -647,7 +667,7 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             // Immediate barge-in on voice playback
             if (g_tts && g_tts->IsSpeaking()) {
-                g_tts->BargeIn();
+                g_tts->StopPlayback();
                 const uint32_t turn_id = g_active_turn_id.load(std::memory_order_relaxed);
                 g_cancelled_turn_id.store(turn_id, std::memory_order_release);
                 g_latency_tracker.CancelTurn(turn_id);
@@ -666,20 +686,100 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             };
             SendIpcJson(stop_msg);
 
+            // True PTT Start:
+            // 1. Mark PTT active and record start time for watchdog
+            g_ptt_active.store(true, std::memory_order_release);
+            g_listening_start_time = std::chrono::steady_clock::now();
+
+            // 2. Snapshot 300 ms pre-roll (4,800 samples @ 16 kHz) from clean ring buffer
+            constexpr size_t kPttPreRollSamples = 4800;
+            std::vector<float> pre_roll(kPttPreRollSamples);
+            size_t peeked = g_clean_ring_buffer.PeekRecent(pre_roll.data(), kPttPreRollSamples);
+            pre_roll.resize(peeked);
+
+            {
+                std::lock_guard<std::mutex> lock(g_ptt_mutex);
+                g_ptt_audio_buffer = std::move(pre_roll);
+            }
+
+            // 3. Instant silent HUD flip (NO "Yes, sir?" playback to avoid tripping barge-in gates)
             g_hud_state.store(HudState::Listening);
             g_hud_label = L"JARVIS // LISTENING...";
             InvalidateRect(hwnd, nullptr, TRUE);
 
-            // Immediate voice acknowledgment
-            if (g_tts) {
-                g_tts->Speak("Yes, sir?");
-            }
-
             return 0;
         }
         case WM_APP_RELEASE_SPEAK: {
-            // Push-to-talk release marks PTT up boundary
-            g_latency_tracker.RecordPttUp(g_active_turn_id.load(std::memory_order_relaxed));
+            if (!g_ptt_active.exchange(false, std::memory_order_acq_rel)) {
+                return 0;
+            }
+
+            const uint32_t turn_id = g_active_turn_id.load(std::memory_order_relaxed);
+            g_latency_tracker.RecordPttUp(turn_id);
+
+            std::vector<float> ptt_audio;
+            {
+                std::lock_guard<std::mutex> lock(g_ptt_mutex);
+                ptt_audio = std::move(g_ptt_audio_buffer);
+            }
+
+            const size_t num_samples = ptt_audio.size();
+            const float duration_ms = static_cast<float>(num_samples) * 1000.0f / 16000.0f;
+
+            double sum_sq = 0.0;
+            for (float s : ptt_audio) {
+                sum_sq += static_cast<double>(s) * static_cast<double>(s);
+            }
+            const float rms = (num_samples > 0) ? static_cast<float>(std::sqrt(sum_sq / static_cast<double>(num_samples))) : 0.0f;
+
+            // Threshold: >= 250 ms (4000 samples @ 16 kHz) and non-silent (RMS >= 0.0001f)
+            if (duration_ms >= 250.0f && rms >= 0.0001f) {
+                g_hud_state.store(HudState::Thinking);
+                g_hud_label = L"JARVIS // THINKING...";
+                InvalidateRect(hwnd, nullptr, TRUE);
+
+                static std::atomic<uint32_t> s_ptt_turn_id{1};
+                uint32_t ptt_turn = s_ptt_turn_id.fetch_add(1);
+                if (ptt_turn == 0) ptt_turn = s_ptt_turn_id.fetch_add(1);
+                g_active_turn_id.store(ptt_turn, std::memory_order_release);
+                g_latency_tracker.RecordVadEnd(ptt_turn);
+
+                if (g_stt && g_stt->IsModelLoaded()) {
+                    g_stt->EnqueueUtterance(std::move(ptt_audio));
+                } else if (!ptt_audio.empty()) {
+                    std::vector<int16_t> pcm16(ptt_audio.size());
+                    for (size_t i = 0; i < ptt_audio.size(); ++i) {
+                        float s = std::clamp(ptt_audio[i], -1.0f, 1.0f);
+                        pcm16[i] = static_cast<int16_t>(s * 32767.0f);
+                    }
+                    const size_t max_bytes = jarvis::ipc::kMaxAudioPayload;
+                    const uint8_t* pcm_bytes = reinterpret_cast<const uint8_t*>(pcm16.data());
+                    size_t total_bytes = pcm16.size() * sizeof(int16_t);
+                    size_t offset = 0;
+                    while (offset < total_bytes) {
+                        size_t chunk_len = std::min(max_bytes, total_bytes - offset);
+                        auto frame = jarvis::ipc::EncodeFrame(
+                            jarvis::ipc::kMsgTypeAudioPcm,
+                            std::string(reinterpret_cast<const char*>(pcm_bytes + offset), chunk_len),
+                            ptt_turn);
+                        EnqueueIpcFrame(std::move(frame));
+                        offset += chunk_len;
+                    }
+                    auto eof_frame = jarvis::ipc::EncodeFrame(
+                        jarvis::ipc::kMsgTypeAudioPcm,
+                        std::string(),
+                        ptt_turn);
+                    EnqueueIpcFrame(std::move(eof_frame));
+                    g_latency_tracker.RecordIpcTx(ptt_turn);
+                }
+            } else {
+                // Short or silent release: return cleanly to Ready immediately
+                if (!g_is_paused.load()) {
+                    g_hud_state.store(HudState::Ready);
+                    g_hud_label = L"JARVIS // READY";
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                }
+            }
             return 0;
         }
         case WM_APP_IPC_READY: {
@@ -799,8 +899,25 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_hud_state.store(g_is_paused.load() ? HudState::Paused : HudState::Ready);
                     g_hud_label = g_is_paused.load() ? L"JARVIS // PAUSED" : L"JARVIS // READY";
                     InvalidateRect(hwnd, nullptr, TRUE);
-                } else if (g_hud_state.load() == HudState::Listening ||
-                           g_hud_state.load() == HudState::Thinking ||
+                } else if (g_hud_state.load() == HudState::Listening) {
+                    // Stuck-Listening Safety Watchdog (15-second ceiling)
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_listening_start_time).count();
+                    if (elapsed_ms >= 15000) {
+                        if (g_ptt_active.load()) {
+                            PostMessageW(hwnd, WM_APP_RELEASE_SPEAK, 0, 0);
+                        } else {
+                            if (g_vad) g_vad->ResetState();
+                            if (!g_is_paused.load()) {
+                                g_hud_state.store(HudState::Ready);
+                                g_hud_label = L"JARVIS // READY";
+                                InvalidateRect(hwnd, nullptr, TRUE);
+                            }
+                        }
+                    } else {
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                } else if (g_hud_state.load() == HudState::Thinking ||
                            g_hud_state.load() == HudState::Speaking) {
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
@@ -1057,6 +1174,75 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 }
 
+struct AudioConfig {
+    std::wstring input_device = L"default";
+    std::wstring output_device = L"default";
+};
+
+AudioConfig LoadAudioConfig(const std::wstring& custom_dir) {
+    AudioConfig cfg;
+    std::vector<std::filesystem::path> search_paths;
+    if (!custom_dir.empty()) {
+        search_paths.push_back(std::filesystem::path(custom_dir) / L"config" / L"config.toml");
+        search_paths.push_back(std::filesystem::path(custom_dir) / L"config.toml");
+    }
+    wchar_t exe_path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+    std::filesystem::path exe_dir = std::filesystem::path(exe_path).parent_path();
+    search_paths.push_back(exe_dir / L"config" / L"config.toml");
+    search_paths.push_back(std::filesystem::current_path() / L"config" / L"config.toml");
+
+    wchar_t local_app_data[MAX_PATH]{};
+    GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
+    search_paths.push_back(std::filesystem::path(local_app_data) / L"Better_Jarvis" / L"config" / L"config.toml");
+
+    for (const auto& p : search_paths) {
+        if (std::filesystem::exists(p)) {
+            std::ifstream file(p);
+            if (!file.is_open()) continue;
+            std::string line;
+            bool in_audio_section = false;
+            while (std::getline(file, line)) {
+                size_t first = line.find_first_not_of(" \t\r\n");
+                if (first == std::string::npos) continue;
+                size_t last = line.find_last_not_of(" \t\r\n");
+                std::string trimmed = line.substr(first, last - first + 1);
+                if (trimmed.empty() || trimmed[0] == '#') continue;
+
+                if (trimmed[0] == '[') {
+                    in_audio_section = (trimmed == "[audio]");
+                    continue;
+                }
+
+                if (in_audio_section) {
+                    auto eq_pos = trimmed.find('=');
+                    if (eq_pos != std::string::npos) {
+                        std::string key = trimmed.substr(0, eq_pos);
+                        std::string val = trimmed.substr(eq_pos + 1);
+
+                        key.erase(0, key.find_first_not_of(" \t"));
+                        if (!key.empty()) key.erase(key.find_last_not_of(" \t") + 1);
+
+                        val.erase(0, val.find_first_not_of(" \t"));
+                        if (!val.empty()) val.erase(val.find_last_not_of(" \t") + 1);
+                        if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
+                            val = val.substr(1, val.size() - 2);
+                        }
+
+                        if (key == "input_device") {
+                            cfg.input_device = std::wstring(val.begin(), val.end());
+                        } else if (key == "output_device") {
+                            cfg.output_device = std::wstring(val.begin(), val.end());
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+    return cfg;
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
@@ -1064,6 +1250,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
 
     const std::wstring args = lpCmdLine ? lpCmdLine : L"";
     bool no_daemon = (args.find(L"--no-daemon") != std::wstring::npos);
+    bool probe_mic = (args.find(L"--probe-mic") != std::wstring::npos);
+    std::wstring cli_input_device;
+    std::wstring cli_output_device;
 
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -1071,11 +1260,122 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
         for (int i = 1; i < argc; ++i) {
             if (std::wcscmp(argv[i], L"--no-daemon") == 0) {
                 no_daemon = true;
+            } else if (std::wcscmp(argv[i], L"--probe-mic") == 0) {
+                probe_mic = true;
             } else if (std::wcscmp(argv[i], L"--data-dir") == 0 && i + 1 < argc) {
                 g_custom_data_dir = argv[++i];
+            } else if (std::wcscmp(argv[i], L"--input-device") == 0 && i + 1 < argc) {
+                cli_input_device = argv[++i];
+            } else if (std::wcscmp(argv[i], L"--output-device") == 0 && i + 1 < argc) {
+                cli_output_device = argv[++i];
             }
         }
         LocalFree(argv);
+    }
+
+    AudioConfig audio_cfg = LoadAudioConfig(g_custom_data_dir);
+    if (!cli_input_device.empty()) {
+        audio_cfg.input_device = cli_input_device;
+    }
+    if (!cli_output_device.empty()) {
+        audio_cfg.output_device = cli_output_device;
+    }
+
+    if (probe_mic) {
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (!hOut || hOut == INVALID_HANDLE_VALUE || GetFileType(hOut) == FILE_TYPE_UNKNOWN) {
+            if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+                FILE* dummy = nullptr;
+                freopen_s(&dummy, "CONOUT$", "w", stdout);
+                freopen_s(&dummy, "CONOUT$", "w", stderr);
+                freopen_s(&dummy, "CONIN$", "r", stdin);
+            }
+        }
+        std::ios_base::sync_with_stdio(true);
+
+        std::wcout << L"[ProbeMic] Initializing WASAPI capture probe on device: \""
+                   << audio_cfg.input_device << L"\"..." << std::endl;
+
+        jarvis::audio::SpscRingBuffer<32768> probe_ring;
+        auto probe_capture = std::make_unique<jarvis::audio::WasapiCapture>(probe_ring, audio_cfg.input_device);
+        if (!probe_capture->Start()) {
+            std::wcerr << L"[ProbeMic] Failed to start WASAPI capture device." << std::endl;
+            CoUninitialize();
+            return 1;
+        }
+
+        // Locate Silero VAD model if available
+        std::filesystem::path models_dir;
+        wchar_t exe_path_buf[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe_path_buf, MAX_PATH);
+        std::filesystem::path exe_dir = std::filesystem::path(exe_path_buf).parent_path();
+        if (!g_custom_data_dir.empty() && std::filesystem::exists(std::filesystem::path(g_custom_data_dir) / L"models")) {
+            models_dir = std::filesystem::path(g_custom_data_dir) / L"models";
+        } else if (std::filesystem::exists(exe_dir / L"models" / L"silero_vad.onnx")) {
+            models_dir = exe_dir / L"models";
+        } else if (std::filesystem::exists("models/silero_vad.onnx")) {
+            models_dir = "models";
+        } else {
+            wchar_t local_app_data[MAX_PATH]{};
+            GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH);
+            models_dir = std::filesystem::path(local_app_data) / L"Better_Jarvis" / L"models";
+        }
+        std::filesystem::path vad_model = models_dir / L"silero_vad.onnx";
+        std::unique_ptr<jarvis::audio::SileroVad> probe_vad;
+        if (std::filesystem::exists(vad_model)) {
+            probe_vad = std::make_unique<jarvis::audio::SileroVad>(probe_ring, vad_model.wstring());
+        }
+
+        std::wcout << L"[ProbeMic] Probing live audio input for 3.0 seconds..." << std::endl;
+
+        float peak_sample = 0.0f;
+        float peak_rms = 0.0f;
+        float max_vad_prob = 0.0f;
+        uint64_t total_samples = 0;
+
+        auto t_start = std::chrono::steady_clock::now();
+        while (true) {
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count();
+            if (elapsed_ms >= 3000) break;
+
+            float buf[512];
+            while (probe_ring.AvailableRead() >= 512) {
+                probe_ring.PopBatch(buf, 512);
+                double sum_sq = 0.0;
+                for (size_t i = 0; i < 512; ++i) {
+                    float s = std::abs(buf[i]);
+                    if (s > peak_sample) peak_sample = s;
+                    sum_sq += static_cast<double>(buf[i]) * static_cast<double>(buf[i]);
+                }
+                float frame_rms = static_cast<float>(std::sqrt(sum_sq / 512.0));
+                if (frame_rms > peak_rms) peak_rms = frame_rms;
+
+                if (probe_vad) {
+                    float prob = probe_vad->EvaluateFrame(buf);
+                    if (prob > max_vad_prob) max_vad_prob = prob;
+                }
+                total_samples += 512;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+
+        probe_capture->Stop();
+
+        std::wcout << L"\n--- MIC PROBE DIAGNOSTIC SCORECARD ---" << std::endl;
+        std::wcout << L"Active Endpoint Friendly Name: " << probe_capture->ActiveDeviceFriendlyName() << std::endl;
+        std::wcout << L"Hardware Mix Format: " << probe_capture->NativeSampleRate() << L" Hz, "
+                   << probe_capture->NativeChannels() << L" channel(s)" << std::endl;
+        std::wcout << L"Negotiated Period: " << std::fixed << std::setprecision(1) << probe_capture->NegotiatedPeriodMs() << L" ms" << std::endl;
+        std::wcout << L"Discontinuities: " << probe_capture->DiscontinuityCount() << std::endl;
+        std::wcout << L"Total Samples Captured (3.0s): " << total_samples << std::endl;
+        std::wcout << L"Peak Amplitude: " << std::fixed << std::setprecision(6) << peak_sample << std::endl;
+        std::wcout << L"Peak RMS: " << std::fixed << std::setprecision(6) << peak_rms << std::endl;
+        std::wcout << L"Max Silero VAD Probability: " << std::fixed << std::setprecision(4) << max_vad_prob << std::endl;
+        std::wcout << L"VAD Engine: " << (probe_vad && probe_vad->IsOnnxLoaded() ? L"Silero VAD ONNX Runtime" : L"RMS/ZCR Fallback") << std::endl;
+        std::wcout << L"--------------------------------------" << std::endl;
+
+        CoUninitialize();
+        return 0;
     }
 
     std::filesystem::path crash_dir;
@@ -1135,7 +1435,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
     g_latency_tracker.SetLogFilePath(host_metrics_file.wstring());
 
     // Initialize Audio Pipeline
-    g_capture = std::make_unique<jarvis::audio::WasapiCapture>(g_raw_mic_buffer);
+    g_capture = std::make_unique<jarvis::audio::WasapiCapture>(g_raw_mic_buffer, audio_cfg.input_device);
 
     // Model paths: check custom data dir, exe dir models, local models dir, or LocalAppData
     std::filesystem::path models_dir;
