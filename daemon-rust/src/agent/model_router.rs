@@ -2,6 +2,7 @@
 pub enum ModelTier {
     Fast,
     Heavy,
+    Fallback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,9 +12,17 @@ pub struct ModelSelection {
     pub reason: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelFallbackRecord {
+    pub requested_model: String,
+    pub effective_model: String,
+    pub fallback_reason: String,
+}
+
 pub struct ModelRouter {
     pub fast_model: String,
     pub heavy_model: String,
+    pub fallback_model: String,
 }
 
 impl ModelRouter {
@@ -23,6 +32,24 @@ impl ModelRouter {
         Self {
             fast_model,
             heavy_model,
+            fallback_model: "gemini-3.8-flash".to_string(),
+        }
+    }
+
+    pub fn with_fallback(fast_model: String, heavy_model: String, fallback_model: String) -> Self {
+        Self {
+            fast_model,
+            heavy_model,
+            fallback_model,
+        }
+    }
+
+    /// Resolves fallback record when a requested model cannot be served.
+    pub fn resolve_fallback(&self, requested: &str, reason: &str) -> ModelFallbackRecord {
+        ModelFallbackRecord {
+            requested_model: requested.to_string(),
+            effective_model: self.fallback_model.clone(),
+            fallback_reason: reason.to_string(),
         }
     }
 
@@ -139,9 +166,10 @@ mod tests {
     use super::*;
 
     fn test_router() -> ModelRouter {
-        ModelRouter::new(
-            "gemini-2.5-flash".to_string(),
-            "gemini-2.5-pro".to_string(),
+        ModelRouter::with_fallback(
+            "gemini-3.5-flash-lite".to_string(),
+            "gemini-4-hydrogen".to_string(),
+            "gemini-3.8-flash".to_string(),
         )
     }
 
@@ -150,7 +178,7 @@ mod tests {
         let router = test_router();
         let sel = router.select_tier("What time is it?", false, 0);
         assert_eq!(sel.tier, ModelTier::Fast);
-        assert_eq!(sel.model_name, "gemini-2.5-flash");
+        assert_eq!(sel.model_name, "gemini-3.5-flash-lite");
         assert_eq!(sel.reason, "fast_conversational_default");
 
         let sel2 = router.select_tier("Remember that my name is Youssef", false, 0);
@@ -162,7 +190,7 @@ mod tests {
         let router = test_router();
         let sel = router.select_tier("Please debug this ring buffer memory ordering issue", false, 0);
         assert_eq!(sel.tier, ModelTier::Heavy);
-        assert_eq!(sel.model_name, "gemini-2.5-pro");
+        assert_eq!(sel.model_name, "gemini-4-hydrogen");
         assert_eq!(sel.reason, "complex_reasoning_or_code_keywords");
 
         let sel2 = router.select_tier("Refactor the audio capture pipeline", false, 0);
@@ -207,5 +235,14 @@ mod tests {
         let sel = router.select_tier("Next step", false, 1);
         assert_eq!(sel.tier, ModelTier::Heavy);
         assert_eq!(sel.reason, "dynamic_escalation_multiturn_react");
+    }
+
+    #[test]
+    fn test_model_fallback_resolution() {
+        let router = test_router();
+        let fallback = router.resolve_fallback("gemini-4-hydrogen", "EnterpriseCredentialsUnavailable");
+        assert_eq!(fallback.requested_model, "gemini-4-hydrogen");
+        assert_eq!(fallback.effective_model, "gemini-3.8-flash");
+        assert_eq!(fallback.fallback_reason, "EnterpriseCredentialsUnavailable");
     }
 }

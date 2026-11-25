@@ -165,3 +165,10 @@ add_executable(test_crash_handler
 target_include_directories(test_crash_handler PRIVATE include)
 target_compile_definitions(test_crash_handler PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
+add_executable(test_hud_watchdog
+    tests/test_hud_watchdog.cpp
+)
+target_include_directories(test_hud_watchdog PRIVATE include)
+target_compile_definitions(test_hud_watchdog PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+
+

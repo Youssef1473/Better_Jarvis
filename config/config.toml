@@ -15,8 +15,23 @@ speed = 1.0
 [ai]
 provider = "google_ai_studio"
 api_key_env = "GEMINI_API_KEY"
-fast_model = "gemini-2.5-flash"
-heavy_model = "gemini-2.5-pro"
+fast_model = "gemini-3.5-flash-lite"
+heavy_model = "gemini-4-hydrogen"
+fallback_model = "gemini-3.8-flash"
+
+[ai.gemini_3_5_flash_lite]
+max_output_tokens = 8192
+
+[ai.gemini_3_8_flash]
+max_output_tokens = 4096
+
+[ai.gemini_4_hydrogen]
+max_output_tokens = 65536
+
+[ai.enterprise]
+project_id = ""
+location = "global"
+allow_metadata_service = false
 
 [security]
 allowed_directories = [

@@ -88,7 +88,8 @@ def verify_cpp():
         ("test_vad", "host-cpp/tests/test_vad.cpp host-cpp/src/audio/silero_vad.cpp", "-I C:/msys64/ucrt64/include/onnxruntime", "-L C:/msys64/ucrt64/lib -L C:/msys64/ucrt64/bin -lonnxruntime"),
         ("test_aec", "host-cpp/tests/test_aec.cpp host-cpp/src/audio/aec_processor.cpp host-cpp/src/audio/aec_delay_estimator.cpp host-cpp/src/audio/piper_tts.cpp", "-I C:/msys64/ucrt64/include/onnxruntime -I C:/msys64/ucrt64/include", "-L C:/msys64/ucrt64/lib -L C:/msys64/ucrt64/bin -lonnxruntime -lole32 -lavrt"),
         ("test_piper_tts", "host-cpp/tests/test_piper_tts.cpp host-cpp/src/audio/piper_tts.cpp", "-DJARVIS_HAS_PIPER=1 -I C:/msys64/ucrt64/include/onnxruntime -I C:/msys64/ucrt64/include", "-L C:/msys64/ucrt64/lib -L C:/msys64/ucrt64/bin -lonnxruntime -lespeak-ng -lole32 -lavrt"),
-        ("test_whisper_stt", "host-cpp/tests/test_whisper_stt.cpp host-cpp/src/audio/whisper_stt.cpp", "-DJARVIS_HAS_WHISPER=1 -I C:/msys64/ucrt64/include", "-L C:/msys64/ucrt64/lib -L C:/msys64/ucrt64/bin -lwhisper -lggml -lggml-base")
+        ("test_whisper_stt", "host-cpp/tests/test_whisper_stt.cpp host-cpp/src/audio/whisper_stt.cpp", "-DJARVIS_HAS_WHISPER=1 -I C:/msys64/ucrt64/include", "-L C:/msys64/ucrt64/lib -L C:/msys64/ucrt64/bin -lwhisper -lggml -lggml-base"),
+        ("test_hud_watchdog", "host-cpp/tests/test_hud_watchdog.cpp", "", "")
     ]
     
     ok = True

@@ -100,8 +100,16 @@ impl RuntimePaths {
     }
 }
 
+pub fn ensure_crypto_provider_installed() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+        .expect("Failed to install default rustls ring crypto provider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -222,11 +230,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let gemini = Arc::new(GeminiClient::new(
-        api_key,
-        Some(config.fast_model),
-        Some(config.heavy_model),
-    )?);
+    let gemini = Arc::new(GeminiClient::from_config(&config)?);
 
     // Create kernel SDDL DACL guard granting Generic All strictly to Logon SID
     let sec_desc = Arc::new(create_pipe_security_descriptor()?);
@@ -499,6 +503,7 @@ async fn process_utterance(
                     active_timing.path = match model_sel.tier {
                         crate::agent::model_router::ModelTier::Fast => telemetry::ExecutionPath::CloudFast,
                         crate::agent::model_router::ModelTier::Heavy => telemetry::ExecutionPath::CloudHeavy,
+                        crate::agent::model_router::ModelTier::Fallback => telemetry::ExecutionPath::CloudFast,
                     };
                     active_timing.routing_reason = model_sel.reason.to_string();
 
@@ -524,7 +529,13 @@ async fn process_utterance(
                         "params": { "text": err_spoken, "turn_id": turn_id }
                     });
                     if let Ok(payload) = serde_json::to_vec(&tts_notify) {
-                        let _ = out_tx.send(IpcFrame { msg_type: MSG_TYPE_CONTROL_JSON, turn_id, payload: Bytes::from(payload) }).await;
+                        let _ = out_tx
+                            .send(IpcFrame {
+                                msg_type: MSG_TYPE_CONTROL_JSON,
+                                turn_id,
+                                payload: Bytes::from(payload),
+                            })
+                            .await;
                     }
                     if let Some(id) = ack_req_id {
                         let ack = JsonRpcResponse {
@@ -548,7 +559,13 @@ async fn process_utterance(
                 "params": { "text": err_spoken, "turn_id": turn_id }
             });
             if let Ok(payload) = serde_json::to_vec(&tts_notify) {
-                let _ = out_tx.send(IpcFrame { msg_type: MSG_TYPE_CONTROL_JSON, turn_id, payload: Bytes::from(payload) }).await;
+                let _ = out_tx
+                    .send(IpcFrame {
+                        msg_type: MSG_TYPE_CONTROL_JSON,
+                        turn_id,
+                        payload: Bytes::from(payload),
+                    })
+                    .await;
             }
             if let Some(id) = ack_req_id {
                 let ack = JsonRpcResponse {
@@ -904,5 +921,31 @@ mod tests {
             .cdp_profiles_dir
             .to_string_lossy()
             .contains("Better_Jarvis"));
+    }
+
+    #[test]
+    fn test_error_path_tts_speak_notification_payload() {
+        let err = anyhow::anyhow!("Rate limit exceeded");
+        let turn_id = 99;
+        let err_spoken = format!("I'm sorry, I encountered an issue: {}", err);
+        let tts_notify = json!({
+            "jsonrpc": "2.0",
+            "method": "tts.speak",
+            "params": { "text": err_spoken, "turn_id": turn_id }
+        });
+        let payload = serde_json::to_vec(&tts_notify).unwrap();
+        let parsed: Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["method"], "tts.speak");
+        assert_eq!(parsed["params"]["turn_id"], 99);
+        assert!(parsed["params"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Rate limit exceeded"));
+    }
+
+    #[test]
+    fn test_global_crypto_provider_installed() {
+        ensure_crypto_provider_installed();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 }

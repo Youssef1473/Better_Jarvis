@@ -28,6 +28,8 @@
 #include "input/hotkey_listener.hpp"
 #include "telemetry/latency_tracker.hpp"
 #include "diagnostics/crash_handler.hpp"
+#include "ui/hud_state.hpp"
+#include "ui/hud_watchdog.hpp"
 
 using json = nlohmann::json;
 
@@ -46,16 +48,6 @@ constexpr UINT    WM_APP_RELEASE_SPEAK = WM_APP + 6;
 constexpr UINT    ID_TRAY_EXIT        = 1001;
 constexpr UINT    ID_TIMER_ANIMATION  = 3001;
 constexpr UINT    ID_TIMER_CONFIRM    = 3002;
-
-enum class HudState {
-    Connecting,
-    Ready,
-    Listening,
-    Thinking,
-    Speaking,
-    Confirmation,
-    Paused
-};
 
 HWND                  g_hwnd = nullptr;
 HANDLE                g_job  = nullptr;
@@ -922,13 +914,18 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         InvalidateRect(hwnd, nullptr, FALSE);
                     }
                 } else if (g_hud_state.load() == HudState::Thinking) {
-                    // Thinking Safety Watchdog (20-second ceiling) prevents permanent freeze on network/API failure
                     auto now = std::chrono::steady_clock::now();
-                    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_listening_start_time).count();
-                    if (elapsed_ms >= 20000) {
-                        if (!g_is_paused.load()) {
-                            g_hud_state.store(HudState::Ready);
-                            g_hud_label = L"JARVIS // READY";
+                    auto outcome = jarvis::ui::EvaluateThinkingWatchdog(
+                        g_hud_state.load(),
+                        g_is_paused.load(),
+                        g_listening_start_time,
+                        now,
+                        std::chrono::milliseconds(20000)
+                    );
+                    if (outcome.triggered) {
+                        if (outcome.state_changed) {
+                            g_hud_state.store(outcome.new_state);
+                            g_hud_label = outcome.new_label;
                             InvalidateRect(hwnd, nullptr, TRUE);
                         }
                     } else {
