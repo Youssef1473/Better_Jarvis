@@ -108,7 +108,7 @@ LRESULT CALLBACK HotkeyListener::MsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, 
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-void HotkeyListener::WorkerThreadLoop() {
+void HotkeyListener::WorkerThreadLoop(HANDLE hReady) {
     worker_thread_id_ = GetCurrentThreadId();
 
     HINSTANCE hInstance = GetModuleHandleW(nullptr);
@@ -123,14 +123,17 @@ void HotkeyListener::WorkerThreadLoop() {
         0,
         kRawInputClassName,
         L"RawInputSink",
-        0, 0, 0, 0, 0,
-        HWND_MESSAGE,
+        WS_POPUP,
+        0, 0, 0, 0,
+        nullptr,
         nullptr,
         hInstance,
         this);
 
     if (!msg_hwnd_) {
+        std::cerr << "[HotkeyListener] CreateWindowExW failed: " << GetLastError() << std::endl;
         running_.store(false, std::memory_order_release);
+        if (hReady) SetEvent(hReady);
         return;
     }
 
@@ -142,11 +145,15 @@ void HotkeyListener::WorkerThreadLoop() {
     rid.hwndTarget  = msg_hwnd_;
 
     if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+        std::cerr << "[HotkeyListener] RegisterRawInputDevices failed: " << GetLastError() << std::endl;
         DestroyWindow(msg_hwnd_);
         msg_hwnd_ = nullptr;
         running_.store(false, std::memory_order_release);
+        if (hReady) SetEvent(hReady);
         return;
     }
+
+    if (hReady) SetEvent(hReady);
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -173,8 +180,7 @@ bool HotkeyListener::Start() {
 
     HANDLE hReady = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     worker_thread_ = std::thread([this, hReady]() {
-        SetEvent(hReady);
-        WorkerThreadLoop();
+        WorkerThreadLoop(hReady);
     });
 
     WaitForSingleObject(hReady, 2000);

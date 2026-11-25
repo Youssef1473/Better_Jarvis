@@ -12,8 +12,8 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            fast_model: "gemini-3.5-flash-lite".to_string(),
-            heavy_model: "gemini-4-hydrogen".to_string(),
+            fast_model: "gemini-2.5-flash".to_string(),
+            heavy_model: "gemini-2.5-pro".to_string(),
             api_key_env: "GEMINI_API_KEY".to_string(),
             allowed_directories: vec![
                 "C:\\Users\\Youssef\\Projects".to_string(),
@@ -127,8 +127,8 @@ mod tests {
     #[test]
     fn test_default_config() {
         let cfg = AppConfig::default();
-        assert_eq!(cfg.fast_model, "gemini-3.5-flash-lite");
-        assert_eq!(cfg.heavy_model, "gemini-4-hydrogen");
+        assert_eq!(cfg.fast_model, "gemini-2.5-flash");
+        assert_eq!(cfg.heavy_model, "gemini-2.5-pro");
         assert_eq!(cfg.api_key_env, "GEMINI_API_KEY");
         assert!(!cfg.allowed_directories.is_empty());
     }
@@ -139,8 +139,8 @@ mod tests {
 [ai]
 provider = "google_ai_studio"
 api_key_env = "MY_CUSTOM_KEY"
-fast_model = "gemini-3.5-flash-lite"
-heavy_model = "gemini-4-hydrogen"
+fast_model = "gemini-2.5-flash"
+heavy_model = "gemini-2.5-pro"
 
 [security]
 allowed_directories = [
@@ -155,8 +155,8 @@ allowed_directories = [
         let cfg = AppConfig::load_from_file_or_default(&test_file);
         let _ = std::fs::remove_file(test_file);
 
-        assert_eq!(cfg.fast_model, "gemini-3.5-flash-lite");
-        assert_eq!(cfg.heavy_model, "gemini-4-hydrogen");
+        assert_eq!(cfg.fast_model, "gemini-2.5-flash");
+        assert_eq!(cfg.heavy_model, "gemini-2.5-pro");
         assert_eq!(cfg.api_key_env, "MY_CUSTOM_KEY");
         assert_eq!(cfg.allowed_directories.len(), 2);
         assert_eq!(cfg.allowed_directories[0], "D:\\Code");

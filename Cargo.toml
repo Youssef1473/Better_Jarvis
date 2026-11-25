@@ -1,3 +1,9 @@
 [workspace]
 members = ["daemon-rust"]
 resolver = "2"
+
+[profile.dev]
+incremental = false
+
+[profile.test]
+incremental = false

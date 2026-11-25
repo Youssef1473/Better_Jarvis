@@ -326,4 +326,36 @@ mod tests {
         assert_eq!(decoded, frame);
         assert!(stream_buf.is_empty());
     }
+
+    #[test]
+    fn test_live_operational_framing_correctness_1000_frames() {
+        let mut codec = JarvisFrameCodec;
+        let mut buffer = BytesMut::with_capacity(65536);
+
+        for i in 0..1000 {
+            let payload = format!("{{\"seq\": {}, \"status\": \"operational\"}}", i);
+            let frame = IpcFrame {
+                msg_type: MSG_TYPE_CONTROL_JSON,
+                turn_id: i,
+                payload: Bytes::from(payload),
+            };
+            // 1. Successful encoding
+            codec.encode(frame.clone(), &mut buffer).expect("encoding must succeed");
+
+            // 2. Successful decoding
+            let decoded = codec.decode(&mut buffer).expect("decoding must succeed").expect("must decode full frame");
+
+            // 3. Verify Message Type
+            assert_eq!(decoded.msg_type, MSG_TYPE_CONTROL_JSON, "message type must match MSG_TYPE_CONTROL_JSON");
+
+            // 4. Verify Turn ID
+            assert_eq!(decoded.turn_id, i, "turn ID must match encoded turn ID");
+
+            // 5. Verify Complete Payload
+            assert_eq!(decoded.payload, frame.payload, "decoded payload must match original payload exactly");
+
+            // 6. Verify Expected Buffer State (buffer must be completely consumed)
+            assert!(buffer.is_empty(), "buffer must be empty after complete frame is consumed");
+        }
+    }
 }

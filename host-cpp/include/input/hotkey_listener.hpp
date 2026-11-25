@@ -62,7 +62,7 @@ public:
     void ResetState() noexcept;
 
 private:
-    void WorkerThreadLoop();
+    void WorkerThreadLoop(HANDLE hReady);
     static LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 private:

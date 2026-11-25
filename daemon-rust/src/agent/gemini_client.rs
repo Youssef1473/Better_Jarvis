@@ -13,8 +13,8 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-pub const DEFAULT_FAST_MODEL: &str = "gemini-3.5-flash-lite";
-pub const DEFAULT_HEAVY_MODEL: &str = "gemini-4-hydrogen";
+pub const DEFAULT_FAST_MODEL: &str = "gemini-2.5-flash";
+pub const DEFAULT_HEAVY_MODEL: &str = "gemini-2.5-pro";
 pub const MAX_TOOL_TURNS: usize = 4;
 pub const HTTP_TIMEOUT_SECS: u64 = 15;
 
@@ -1596,8 +1596,8 @@ mod tests {
     #[test]
     fn test_client_model_defaults() {
         let client = GeminiClient::new(None, None, None).unwrap();
-        assert_eq!(client.fast_model, "gemini-3.5-flash-lite");
-        assert_eq!(client.heavy_model, "gemini-4-hydrogen");
+        assert_eq!(client.fast_model, "gemini-2.5-flash");
+        assert_eq!(client.heavy_model, "gemini-2.5-pro");
     }
 
     #[tokio::test]

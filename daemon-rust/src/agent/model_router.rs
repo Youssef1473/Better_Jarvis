@@ -140,8 +140,8 @@ mod tests {
 
     fn test_router() -> ModelRouter {
         ModelRouter::new(
-            "gemini-3.5-flash-lite".to_string(),
-            "gemini-4-hydrogen".to_string(),
+            "gemini-2.5-flash".to_string(),
+            "gemini-2.5-pro".to_string(),
         )
     }
 
@@ -150,7 +150,7 @@ mod tests {
         let router = test_router();
         let sel = router.select_tier("What time is it?", false, 0);
         assert_eq!(sel.tier, ModelTier::Fast);
-        assert_eq!(sel.model_name, "gemini-3.5-flash-lite");
+        assert_eq!(sel.model_name, "gemini-2.5-flash");
         assert_eq!(sel.reason, "fast_conversational_default");
 
         let sel2 = router.select_tier("Remember that my name is Youssef", false, 0);
@@ -162,7 +162,7 @@ mod tests {
         let router = test_router();
         let sel = router.select_tier("Please debug this ring buffer memory ordering issue", false, 0);
         assert_eq!(sel.tier, ModelTier::Heavy);
-        assert_eq!(sel.model_name, "gemini-4-hydrogen");
+        assert_eq!(sel.model_name, "gemini-2.5-pro");
         assert_eq!(sel.reason, "complex_reasoning_or_code_keywords");
 
         let sel2 = router.select_tier("Refactor the audio capture pipeline", false, 0);

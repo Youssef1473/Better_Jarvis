@@ -21,5 +21,10 @@ models/
 /dist/
 scripts/__pycache__/
 
-# Agent Scratch & Local Skills
-.agents/
+# Agent temporary caches, scratch, and local execution artifacts
+.agents/**/__pycache__/
+.agents/**/*.pyc
+.agents/**/*.log
+.agents/**/*.tmp
+.agents/scratch/
+.agents/evals/*_results.json

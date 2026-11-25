@@ -882,8 +882,12 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     InvalidateRect(hwnd, nullptr, TRUE);
                     return 0;
                 } else {
-                    // Clicked anywhere on the HUD pill body -> trigger voice listening & speak acknowledgment
-                    PostMessageW(hwnd, WM_APP_TRIGGER_SPEAK, 0, 0);
+                    // Clicked anywhere on HUD pill body: Toggle push-to-talk listening state cleanly
+                    if (g_ptt_active.load(std::memory_order_acquire)) {
+                        PostMessageW(hwnd, WM_APP_RELEASE_SPEAK, 0, 0);
+                    } else if (g_hud_state.load() == HudState::Ready) {
+                        PostMessageW(hwnd, WM_APP_TRIGGER_SPEAK, 0, 0);
+                    }
                     return 0;
                 }
             }
@@ -917,8 +921,20 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     } else {
                         InvalidateRect(hwnd, nullptr, FALSE);
                     }
-                } else if (g_hud_state.load() == HudState::Thinking ||
-                           g_hud_state.load() == HudState::Speaking) {
+                } else if (g_hud_state.load() == HudState::Thinking) {
+                    // Thinking Safety Watchdog (20-second ceiling) prevents permanent freeze on network/API failure
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_listening_start_time).count();
+                    if (elapsed_ms >= 20000) {
+                        if (!g_is_paused.load()) {
+                            g_hud_state.store(HudState::Ready);
+                            g_hud_label = L"JARVIS // READY";
+                            InvalidateRect(hwnd, nullptr, TRUE);
+                        }
+                    } else {
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                } else if (g_hud_state.load() == HudState::Speaking) {
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
             } else if (wParam == ID_TIMER_CONFIRM) {

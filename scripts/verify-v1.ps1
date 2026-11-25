@@ -155,6 +155,7 @@ Write-Host "     [PASS] Zero elevation flags; strictly Limited RunLevel (Medium 
 # 3. Rust Full Test & Lint Gate
 # -----------------------------------------------------------------------------
 Write-Host "`n[3/6] Rust Full Test & Lint Gate..." -ForegroundColor Cyan
+$env:CARGO_INCREMENTAL = "0"
 
 $ucrtBin = "C:\msys64\ucrt64\bin"
 if (Test-Path "$ucrtBin\onnxruntime.dll") {

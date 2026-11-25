@@ -517,6 +517,15 @@ async fn process_utterance(
                 }
                 Err(err) => {
                     warn!("Gemini LLM streaming failed: {}", err);
+                    let err_spoken = format!("I'm sorry, I encountered an issue: {}", err);
+                    let tts_notify = json!({
+                        "jsonrpc": "2.0",
+                        "method": "tts.speak",
+                        "params": { "text": err_spoken, "turn_id": turn_id }
+                    });
+                    if let Ok(payload) = serde_json::to_vec(&tts_notify) {
+                        let _ = out_tx.send(IpcFrame { msg_type: MSG_TYPE_CONTROL_JSON, turn_id, payload: Bytes::from(payload) }).await;
+                    }
                     if let Some(id) = ack_req_id {
                         let ack = JsonRpcResponse {
                             jsonrpc: "2.0",
@@ -532,6 +541,15 @@ async fn process_utterance(
         }
         Err(err) => {
             error!("Intent execution failed: {}", err);
+            let err_spoken = format!("Execution failed: {}", err);
+            let tts_notify = json!({
+                "jsonrpc": "2.0",
+                "method": "tts.speak",
+                "params": { "text": err_spoken, "turn_id": turn_id }
+            });
+            if let Ok(payload) = serde_json::to_vec(&tts_notify) {
+                let _ = out_tx.send(IpcFrame { msg_type: MSG_TYPE_CONTROL_JSON, turn_id, payload: Bytes::from(payload) }).await;
+            }
             if let Some(id) = ack_req_id {
                 let ack = JsonRpcResponse {
                     jsonrpc: "2.0",
