@@ -2,12 +2,21 @@
 #include "audio/mmcss_guard.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <unordered_map>
+
+#ifndef PKEY_Device_FriendlyName
+static const PROPERTYKEY kPiperDeviceFriendlyName = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14
+};
+#else
+static const PROPERTYKEY& kPiperDeviceFriendlyName = PKEY_Device_FriendlyName;
+#endif
 
 #ifdef JARVIS_HAS_PIPER
 #include <onnxruntime_cxx_api.h>
@@ -42,8 +51,77 @@ struct PiperTts::PiperImpl {
 #endif
 };
 
-PiperTts::PiperTts(const std::string& model_path, const std::string& config_path)
-    : impl_(std::make_unique<PiperImpl>()) {
+class RenderDeviceNotifier : public IMMNotificationClient {
+public:
+    explicit RenderDeviceNotifier(PiperTts* owner) : owner_(owner), ref_count_(1) {}
+    virtual ~RenderDeviceNotifier() = default;
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return InterlockedIncrement(&ref_count_);
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG count = InterlockedDecrement(&ref_count_);
+        if (count == 0) {
+            delete this;
+        }
+        return count;
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMMNotificationClient)) {
+            *ppv = static_cast<IMMNotificationClient*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(
+        EDataFlow flow, ERole role, LPCWSTR /*pwstrDefaultDeviceId*/) override {
+        if (flow == eRender && (role == eConsole || role == eCommunications)) {
+            if (owner_) {
+                owner_->RequestReinit();
+            }
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR /*pwstrDeviceId*/, DWORD /*dwNewState*/) override {
+        if (owner_) {
+            owner_->RequestReinit();
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR /*pwstrDeviceId*/) override {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR /*pwstrDeviceId*/) override {
+        if (owner_) {
+            owner_->RequestReinit();
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR /*pwstrDeviceId*/, const PROPERTYKEY /*key*/) override {
+        return S_OK;
+    }
+
+private:
+    PiperTts* owner_{nullptr};
+    LONG ref_count_{1};
+};
+
+PiperTts::PiperTts(
+    const std::string& model_path,
+    const std::string& config_path,
+    const std::wstring& target_device)
+    : target_device_name_(target_device),
+      impl_(std::make_unique<PiperImpl>()) {
     render_scratch_.reserve(8192);
     ref_scratch_.reserve(8192);
     h_abort_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -460,22 +538,110 @@ void PiperTts::ResampleTo16kMono(
     }
 }
 
-bool PiperTts::InitRenderEndpoint(HANDLE event_handle) {
-    HRESULT hr = CoCreateInstance(
-        __uuidof(MMDeviceEnumerator),
-        nullptr,
-        CLSCTX_ALL,
-        __uuidof(IMMDeviceEnumerator),
-        reinterpret_cast<void**>(&enumerator_));
+void PiperTts::CleanupRenderEndpoint() noexcept {
+    if (render_client_) {
+        render_client_->Stop();
+        render_client_->Reset();
+    }
+    if (render_service_) {
+        render_service_->Release();
+        render_service_ = nullptr;
+    }
+    if (mix_format_) {
+        CoTaskMemFree(mix_format_);
+        mix_format_ = nullptr;
+    }
+    if (render_client_) {
+        render_client_->Release();
+        render_client_ = nullptr;
+    }
+}
 
-    if (FAILED(hr) || !enumerator_) return false;
+bool PiperTts::InitRenderEndpoint(HANDLE event_handle) {
+    if (!enumerator_) {
+        HRESULT hr = CoCreateInstance(
+            __uuidof(MMDeviceEnumerator),
+            nullptr,
+            CLSCTX_ALL,
+            __uuidof(IMMDeviceEnumerator),
+            reinterpret_cast<void**>(&enumerator_));
+
+        if (FAILED(hr) || !enumerator_) return false;
+
+        if (!notifier_) {
+            notifier_ = new RenderDeviceNotifier(this);
+            enumerator_->RegisterEndpointNotificationCallback(notifier_);
+        }
+    }
 
     IMMDevice* device = nullptr;
-    hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-    if (FAILED(hr) || !device) {
-        hr = enumerator_->GetDefaultAudioEndpoint(eRender, eCommunications, &device);
+    HRESULT hr = S_OK;
+
+    if (target_device_name_.empty() || target_device_name_ == L"default") {
+        hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+        if (FAILED(hr) || !device) {
+            hr = enumerator_->GetDefaultAudioEndpoint(eRender, eCommunications, &device);
+        }
+    } else {
+        IMMDeviceCollection* collection = nullptr;
+        hr = enumerator_->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
+        if (SUCCEEDED(hr) && collection) {
+            UINT count = 0;
+            collection->GetCount(&count);
+            for (UINT i = 0; i < count; ++i) {
+                IMMDevice* candidate = nullptr;
+                if (SUCCEEDED(collection->Item(i, &candidate)) && candidate) {
+                    IPropertyStore* props = nullptr;
+                    if (SUCCEEDED(candidate->OpenPropertyStore(STGM_READ, &props)) && props) {
+                        PROPVARIANT varName;
+                        PropVariantInit(&varName);
+                        if (SUCCEEDED(props->GetValue(kPiperDeviceFriendlyName, &varName)) && varName.pwszVal) {
+                            std::wstring candidate_name = varName.pwszVal;
+                            auto to_lower = [](std::wstring s) {
+                                for (auto& c : s) c = static_cast<wchar_t>(std::tolower(c));
+                                return s;
+                            };
+                            if (to_lower(candidate_name).find(to_lower(target_device_name_)) != std::wstring::npos) {
+                                device = candidate;
+                                device->AddRef();
+                                PropVariantClear(&varName);
+                                props->Release();
+                                candidate->Release();
+                                break;
+                            }
+                        }
+                        PropVariantClear(&varName);
+                        props->Release();
+                    }
+                    candidate->Release();
+                }
+            }
+            collection->Release();
+        }
+        if (!device) {
+            std::wcerr << L"[PiperTts] Target render device \"" << target_device_name_
+                       << L"\" not found among active render devices. Falling back to default." << std::endl;
+            hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+            if (FAILED(hr) || !device) {
+                hr = enumerator_->GetDefaultAudioEndpoint(eRender, eCommunications, &device);
+            }
+        }
     }
+
     if (FAILED(hr) || !device) return false;
+
+    std::wstring friendly_name = L"Default Render Device";
+    IPropertyStore* dev_props = nullptr;
+    if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &dev_props)) && dev_props) {
+        PROPVARIANT varName;
+        PropVariantInit(&varName);
+        if (SUCCEEDED(dev_props->GetValue(kPiperDeviceFriendlyName, &varName)) && varName.pwszVal) {
+            friendly_name = varName.pwszVal;
+        }
+        PropVariantClear(&varName);
+        dev_props->Release();
+    }
+    active_friendly_name_ = friendly_name;
 
     hr = device->Activate(
         __uuidof(IAudioClient),
@@ -487,7 +653,10 @@ bool PiperTts::InitRenderEndpoint(HANDLE event_handle) {
     if (FAILED(hr) || !render_client_) return false;
 
     hr = render_client_->GetMixFormat(&mix_format_);
-    if (FAILED(hr) || !mix_format_) return false;
+    if (FAILED(hr) || !mix_format_) {
+        CleanupRenderEndpoint();
+        return false;
+    }
 
     native_rate_ = mix_format_->nSamplesPerSec;
     native_channels_ = mix_format_->nChannels;
@@ -501,22 +670,40 @@ bool PiperTts::InitRenderEndpoint(HANDLE event_handle) {
         mix_format_,
         nullptr);
 
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        CleanupRenderEndpoint();
+        return false;
+    }
 
     hr = render_client_->SetEventHandle(event_handle);
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        CleanupRenderEndpoint();
+        return false;
+    }
 
     hr = render_client_->GetService(
         __uuidof(IAudioRenderClient),
         reinterpret_cast<void**>(&render_service_));
 
-    if (FAILED(hr) || !render_service_) return false;
+    if (FAILED(hr) || !render_service_) {
+        CleanupRenderEndpoint();
+        return false;
+    }
 
     hr = render_client_->GetBufferSize(&buffer_frame_count_);
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        CleanupRenderEndpoint();
+        return false;
+    }
 
     hr = render_client_->Start();
-    return SUCCEEDED(hr);
+    if (FAILED(hr)) {
+        CleanupRenderEndpoint();
+        return false;
+    }
+    std::wcout << L"[PiperTts] Active render endpoint: \"" << active_friendly_name_
+               << L"\" @ " << native_rate_ << L" Hz, " << native_channels_ << L" ch" << std::endl;
+    return true;
 }
 
 void PiperTts::RenderThreadLoop() {
@@ -530,17 +717,24 @@ void PiperTts::RenderThreadLoop() {
         return;
     }
 
-    if (!InitRenderEndpoint(hRenderEvent)) {
-        CloseHandle(hRenderEvent);
-        CoUninitialize();
-        return;
-    }
-
+    int backoff_ms = 100;
     uint64_t local_epoch = playback_epoch_.load(std::memory_order_acquire);
     size_t chunk_cursor = 0;
     AudioChunk current_chunk;
 
     while (running_.load(std::memory_order_relaxed)) {
+        // 0. Initialize or recover render endpoint on device invalidation / hot-swap
+        if (!render_client_ || reinit_requested_.exchange(false, std::memory_order_acquire)) {
+            CleanupRenderEndpoint();
+            if (!InitRenderEndpoint(hRenderEvent)) {
+                is_speaking_.store(false, std::memory_order_release);
+                std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+                backoff_ms = std::min(backoff_ms * 2, 2000);
+                continue;
+            }
+            backoff_ms = 100;
+        }
+
         // 1. Instant check for Barge-In trigger
         uint64_t current_epoch = playback_epoch_.load(std::memory_order_acquire);
         if (current_epoch != local_epoch) {
@@ -571,6 +765,7 @@ void PiperTts::RenderThreadLoop() {
                 queue_cv_.wait_for(lock, std::chrono::milliseconds(10), [this, &local_epoch]() {
                     return !running_.load(std::memory_order_relaxed) ||
                            !pcm_queue_.empty() ||
+                           reinit_requested_.load(std::memory_order_relaxed) ||
                            playback_epoch_.load(std::memory_order_relaxed) != local_epoch;
                 });
                 continue;
@@ -602,7 +797,12 @@ void PiperTts::RenderThreadLoop() {
 
         UINT32 padding = 0;
         HRESULT hr = render_client_->GetCurrentPadding(&padding);
-        if (FAILED(hr)) continue;
+        if (FAILED(hr)) {
+            if (IsDeviceInvalidatedHresult(hr)) {
+                reinit_requested_.store(true, std::memory_order_release);
+            }
+            continue;
+        }
 
         UINT32 frames_available = buffer_frame_count_ - padding;
         if (frames_available == 0) continue;
@@ -635,21 +835,27 @@ void PiperTts::RenderThreadLoop() {
         hr = render_service_->GetBuffer(frames_to_write, &pData);
         if (SUCCEEDED(hr) && pData) {
             std::memcpy(pData, render_scratch_.data(), frames_to_write * native_channels_ * sizeof(float));
-            render_service_->ReleaseBuffer(frames_to_write, 0);
-            chunk_cursor += mono_to_read;
+            HRESULT rel_hr = render_service_->ReleaseBuffer(frames_to_write, 0);
+            if (IsDeviceInvalidatedHresult(rel_hr)) {
+                reinit_requested_.store(true, std::memory_order_release);
+            } else {
+                chunk_cursor += mono_to_read;
+            }
+        } else if (IsDeviceInvalidatedHresult(hr)) {
+            reinit_requested_.store(true, std::memory_order_release);
         }
     }
 
-    if (render_client_) {
-        render_client_->Stop();
-        render_client_->Reset();
-        if (render_service_) render_service_->Release();
-        if (mix_format_) CoTaskMemFree(mix_format_);
-        render_client_->Release();
-    }
+    CleanupRenderEndpoint();
 
     if (enumerator_) {
+        if (notifier_) {
+            enumerator_->UnregisterEndpointNotificationCallback(notifier_);
+            notifier_->Release();
+            notifier_ = nullptr;
+        }
         enumerator_->Release();
+        enumerator_ = nullptr;
     }
 
     CloseHandle(hRenderEvent);

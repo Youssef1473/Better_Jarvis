@@ -1,4 +1,4 @@
-#include <cassert>
+#include "test_assert.hpp"
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -24,12 +24,12 @@ void TestQpcMonotonicAndDurations() {
     tracker.RecordTtsFirstAudio(turn_id);
 
     auto summary = tracker.GetSummary();
-    assert(summary.total_completed_turns == 1);
-    assert(summary.vad_to_stt.sample_count == 1);
-    assert(summary.vad_to_stt.p50_ms >= 5.0 && summary.vad_to_stt.p50_ms <= 100.0);
-    assert(summary.stt_to_ipc.p50_ms >= 2.0 && summary.stt_to_ipc.p50_ms <= 100.0);
-    assert(summary.ipc_to_first_audio.p50_ms >= 5.0 && summary.ipc_to_first_audio.p50_ms <= 100.0);
-    assert(summary.end_to_end_ttfa.p50_ms >= 20.0 && summary.end_to_end_ttfa.p50_ms <= 200.0);
+    TEST_ASSERT(summary.total_completed_turns == 1);
+    TEST_ASSERT(summary.vad_to_stt.sample_count == 1);
+    TEST_ASSERT(summary.vad_to_stt.p50_ms >= 5.0 && summary.vad_to_stt.p50_ms <= 100.0);
+    TEST_ASSERT(summary.stt_to_ipc.p50_ms >= 2.0 && summary.stt_to_ipc.p50_ms <= 100.0);
+    TEST_ASSERT(summary.ipc_to_first_audio.p50_ms >= 5.0 && summary.ipc_to_first_audio.p50_ms <= 100.0);
+    TEST_ASSERT(summary.end_to_end_ttfa.p50_ms >= 20.0 && summary.end_to_end_ttfa.p50_ms <= 200.0);
 }
 
 void TestPercentilesAndRollingWindow() {
@@ -42,12 +42,12 @@ void TestPercentilesAndRollingWindow() {
     }
 
     auto summary100 = tracker.GetSummary();
-    assert(summary100.total_completed_turns == 100);
-    assert(summary100.end_to_end_ttfa.sample_count == 100);
+    TEST_ASSERT(summary100.total_completed_turns == 100);
+    TEST_ASSERT(summary100.end_to_end_ttfa.sample_count == 100);
 
     // Sorted indices: 100 items -> idx 50 is item 51 (value 51.0), idx 95 is item 96 (value 96.0)
-    assert(std::fabs(summary100.end_to_end_ttfa.p50_ms - 51.0) < 0.1);
-    assert(std::fabs(summary100.end_to_end_ttfa.p95_ms - 96.0) < 0.1);
+    TEST_ASSERT(std::fabs(summary100.end_to_end_ttfa.p50_ms - 51.0) < 0.1);
+    TEST_ASSERT(std::fabs(summary100.end_to_end_ttfa.p95_ms - 96.0) < 0.1);
 
     // Now inject 150 more turns (total 250) to test 200-item rolling window eviction
     for (int i = 101; i <= 250; ++i) {
@@ -55,15 +55,15 @@ void TestPercentilesAndRollingWindow() {
         tracker.InjectCompletedTurn(val, val, val, val);
     }
 
-    assert(tracker.GetCompletedCount() == 200);
+    TEST_ASSERT(tracker.GetCompletedCount() == 200);
     auto summary200 = tracker.GetSummary();
-    assert(summary200.total_completed_turns == 200);
+    TEST_ASSERT(summary200.total_completed_turns == 200);
 
     // Items now in window: 51 through 250 (200 items)
     // idx 50 in 200 items: 51 + 100 = 151
     // idx 95 in 200 items (0.95 * 200 = 190): 51 + 190 = 241
-    assert(std::fabs(summary200.end_to_end_ttfa.p50_ms - 151.0) < 0.1);
-    assert(std::fabs(summary200.end_to_end_ttfa.p95_ms - 241.0) < 0.1);
+    TEST_ASSERT(std::fabs(summary200.end_to_end_ttfa.p50_ms - 151.0) < 0.1);
+    TEST_ASSERT(std::fabs(summary200.end_to_end_ttfa.p95_ms - 241.0) < 0.1);
 }
 
 void TestCancellationAndStaleTurnRejection() {
@@ -77,22 +77,22 @@ void TestCancellationAndStaleTurnRejection() {
 
     // Cancel turn 102 (e.g. barge-in occurred)
     tracker.CancelTurn(cancelled_turn);
-    assert(tracker.IsTurnCancelled(cancelled_turn));
-    assert(!tracker.IsTurnCancelled(active_turn));
+    TEST_ASSERT(tracker.IsTurnCancelled(cancelled_turn));
+    TEST_ASSERT(!tracker.IsTurnCancelled(active_turn));
 
     // Stale/cancelled chunk arrival for 102 should be ignored
     tracker.RecordSttDone(cancelled_turn);
     tracker.RecordIpcTx(cancelled_turn);
     tracker.RecordTtsFirstAudio(cancelled_turn);
 
-    assert(tracker.GetCompletedCount() == 0);
+    TEST_ASSERT(tracker.GetCompletedCount() == 0);
 
     // Active turn 101 completes normally
     tracker.RecordSttDone(active_turn);
     tracker.RecordIpcTx(active_turn);
     tracker.RecordTtsFirstAudio(active_turn);
 
-    assert(tracker.GetCompletedCount() == 1);
+    TEST_ASSERT(tracker.GetCompletedCount() == 1);
 }
 
 int main() {

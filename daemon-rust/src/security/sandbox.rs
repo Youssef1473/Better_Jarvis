@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
-use std::ffi::c_void;
-use std::io;
+use std::ffi::{c_void, OsStr};
+use std::io::{self, Read};
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 #[repr(C)]
@@ -38,9 +39,64 @@ struct JobObjectExtendedLimitInformation {
     peak_job_memory_limit: usize,
 }
 
+#[repr(C)]
+struct SecurityAttributes {
+    n_length: u32,
+    lp_security_descriptor: *mut c_void,
+    b_inherit_handle: i32,
+}
+
+#[repr(C)]
+struct StartupInfoW {
+    cb: u32,
+    lp_reserved: *mut u16,
+    lp_desktop: *mut u16,
+    lp_title: *mut u16,
+    dw_x: u32,
+    dw_y: u32,
+    dw_x_size: u32,
+    dw_y_size: u32,
+    dw_x_count_chars: u32,
+    dw_y_count_chars: u32,
+    dw_fill_attribute: u32,
+    dw_flags: u32,
+    w_show_window: u16,
+    cb_reserved2: u16,
+    lp_reserved2: *mut u8,
+    h_std_input: *mut c_void,
+    h_std_output: *mut c_void,
+    h_std_error: *mut c_void,
+}
+
+#[repr(C)]
+struct StartupInfoExW {
+    startup_info: StartupInfoW,
+    lp_attribute_list: *mut c_void,
+}
+
+#[repr(C)]
+struct ProcessInformation {
+    h_process: *mut c_void,
+    h_thread: *mut c_void,
+    dw_process_id: u32,
+    dw_thread_id: u32,
+}
+
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
 const JOB_OBJECT_LIMIT_JOB_MEMORY: u32 = 0x00000200;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
+const CREATE_SUSPENDED: u32 = 0x00000004;
+const CREATE_UNICODE_ENVIRONMENT: u32 = 0x00000400;
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x00080000;
+const STARTF_USESTDHANDLES: u32 = 0x00000100;
+const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x00020002;
+const GENERIC_READ: u32 = 0x80000000;
+const FILE_SHARE_READ: u32 = 0x00000001;
+const FILE_SHARE_WRITE: u32 = 0x00000002;
+const OPEN_EXISTING: u32 = 3;
+const INFINITE: u32 = 0xFFFFFFFF;
 
 extern "system" {
     fn CreateJobObjectW(lpJobAttributes: *mut c_void, lpName: *const u16) -> *mut c_void;
@@ -51,6 +107,58 @@ extern "system" {
         cbJobObjectInformationLength: u32,
     ) -> i32;
     fn AssignProcessToJobObject(hJob: *mut c_void, hProcess: *mut c_void) -> i32;
+    fn CreatePipe(
+        hReadPipe: *mut *mut c_void,
+        hWritePipe: *mut *mut c_void,
+        lpPipeAttributes: *const c_void,
+        nSize: u32,
+    ) -> i32;
+    fn SetHandleInformation(
+        hObject: *mut c_void,
+        dwMask: u32,
+        dwFlags: u32,
+    ) -> i32;
+    fn CreateFileW(
+        lpFileName: *const u16,
+        dwDesiredAccess: u32,
+        dwShareMode: u32,
+        lpSecurityAttributes: *const c_void,
+        dwCreationDisposition: u32,
+        dwFlagsAndAttributes: u32,
+        hTemplateFile: *mut c_void,
+    ) -> *mut c_void;
+    fn InitializeProcThreadAttributeList(
+        lpAttributeList: *mut c_void,
+        dwAttributeCount: u32,
+        dwFlags: u32,
+        lpSize: *mut usize,
+    ) -> i32;
+    fn UpdateProcThreadAttribute(
+        lpAttributeList: *mut c_void,
+        dwFlags: u32,
+        Attribute: usize,
+        lpValue: *mut c_void,
+        cbSize: usize,
+        lpPreviousValue: *mut c_void,
+        lpReturnSize: *mut usize,
+    ) -> i32;
+    fn DeleteProcThreadAttributeList(lpAttributeList: *mut c_void);
+    fn CreateProcessW(
+        lpApplicationName: *const u16,
+        lpCommandLine: *mut u16,
+        lpProcessAttributes: *mut c_void,
+        lpThreadAttributes: *mut c_void,
+        bInheritHandles: i32,
+        dwCreationFlags: u32,
+        lpEnvironment: *mut c_void,
+        lpCurrentDirectory: *const u16,
+        lpStartupInfo: *mut c_void,
+        lpProcessInformation: *mut ProcessInformation,
+    ) -> i32;
+    fn ResumeThread(hThread: *mut c_void) -> u32;
+    fn TerminateProcess(hProcess: *mut c_void, uExitCode: u32) -> i32;
+    fn WaitForSingleObject(hHandle: *mut c_void, dwMilliseconds: u32) -> u32;
+    fn GetExitCodeProcess(hProcess: *mut c_void, lpExitCode: *mut u32) -> i32;
     fn CloseHandle(hObject: *mut c_void) -> i32;
 }
 
@@ -104,6 +212,10 @@ impl JobObjectGuard {
         }
         Ok(())
     }
+
+    pub fn raw_handle(&self) -> *mut c_void {
+        self.handle
+    }
 }
 
 impl Drop for JobObjectGuard {
@@ -151,6 +263,40 @@ const DANGEROUS_ENV_VARS: &[&str] = &[
 
 /// Resolves a program name against the strict binary allowlist to a verified absolute executable path.
 pub fn resolve_allowlisted_binary(program: &str) -> Result<PathBuf> {
+    let temp_dir = std::env::temp_dir();
+    let current_dir = std::env::current_dir().ok();
+
+    if program.contains('\\') || program.contains('/') {
+        let pb = PathBuf::from(program);
+        let stem = pb
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        if !ALLOWLISTED_BINARIES.contains(&stem.as_str()) {
+            anyhow::bail!(
+                "Binary '{}' is not on the execution allowlist. Zero-shell policy permits only: {:?}",
+                program,
+                ALLOWLISTED_BINARIES
+            );
+        }
+        let canon = pb.canonicalize().unwrap_or_else(|_| pb.clone());
+        let temp_canon = temp_dir.canonicalize().unwrap_or_else(|_| temp_dir.clone());
+        if canon.starts_with(&temp_canon) || pb.starts_with(&temp_dir) {
+            anyhow::bail!("Allowlisted binary path inside %TEMP% is forbidden: {:?}", pb);
+        }
+        if let Some(ref cwd) = current_dir {
+            let cwd_canon = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+            if canon.parent() == Some(cwd_canon.as_path()) || pb.parent() == Some(cwd.as_path()) {
+                anyhow::bail!("Allowlisted binary path inside current working directory is forbidden: {:?}", pb);
+            }
+        }
+        if canon.is_file() {
+            return Ok(canon);
+        }
+        anyhow::bail!("Allowlisted binary '{}' not found at explicit path", program);
+    }
+
     let lower = program.to_lowercase();
     let base_name = lower.trim_end_matches(".exe");
 
@@ -163,18 +309,7 @@ pub fn resolve_allowlisted_binary(program: &str) -> Result<PathBuf> {
         );
     }
 
-    // If an explicit path was provided, verify it exists directly
-    if program.contains('\\') || program.contains('/') {
-        let pb = PathBuf::from(program);
-        if pb.is_file() {
-            return Ok(pb.canonicalize().unwrap_or(pb));
-        }
-    }
-
     // Anti-CWD Hijack: Explicitly skip relative paths, current directory, and %TEMP%
-    let current_dir = std::env::current_dir().ok();
-    let temp_dir = std::env::temp_dir();
-
     // Search system PATH for the binary
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
@@ -319,8 +454,273 @@ pub fn validate_binary_arguments(program: &str, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Executes an allowlisted binary in the Windows Job Object sandbox with scrubbed environment
-/// and strictly zero shell interpolation.
+struct OwnedWinHandle(*mut c_void);
+
+unsafe impl Send for OwnedWinHandle {}
+unsafe impl Sync for OwnedWinHandle {}
+
+impl OwnedWinHandle {
+    fn as_raw(&self) -> *mut c_void {
+        self.0
+    }
+}
+
+impl Drop for OwnedWinHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CloseHandle(self.0);
+            }
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+fn quote_win32_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| c == ' ' || c == '\t' || c == '"') {
+        return arg.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else if ch == '"' {
+            out.push_str(&"\\".repeat(backslashes * 2 + 1));
+            out.push('"');
+            backslashes = 0;
+        } else {
+            out.push_str(&"\\".repeat(backslashes));
+            backslashes = 0;
+            out.push(ch);
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
+}
+
+fn build_scrubbed_unicode_env() -> Vec<u16> {
+    let mut wide = Vec::new();
+    for (k, v) in std::env::vars_os() {
+        let k_upper = k.to_string_lossy().to_uppercase();
+        if DANGEROUS_ENV_VARS.contains(&k_upper.as_str()) {
+            continue;
+        }
+        wide.extend(k.encode_wide());
+        wide.push(b'=' as u16);
+        wide.extend(v.encode_wide());
+        wide.push(0);
+    }
+    wide.push(0);
+    wide
+}
+
+struct SpawnedSuspendedProcess {
+    process_handle: OwnedWinHandle,
+    stdout_file: std::fs::File,
+    stderr_file: std::fs::File,
+}
+
+fn spawn_suspended_assign_and_resume<F>(
+    exe_path: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+    job: &JobObjectGuard,
+    before_resume_hook: F,
+) -> Result<SpawnedSuspendedProcess>
+where
+    F: FnOnce(*mut c_void) -> Result<()>,
+{
+    let mut stdout_read: *mut c_void = std::ptr::null_mut();
+    let mut stdout_write: *mut c_void = std::ptr::null_mut();
+    let mut stderr_read: *mut c_void = std::ptr::null_mut();
+    let mut stderr_write: *mut c_void = std::ptr::null_mut();
+
+    let nul_wide: Vec<u16> = OsStr::new("NUL").encode_wide().chain(std::iter::once(0)).collect();
+    let nul_sa = SecurityAttributes {
+        n_length: std::mem::size_of::<SecurityAttributes>() as u32,
+        lp_security_descriptor: std::ptr::null_mut(),
+        b_inherit_handle: 1,
+    };
+    let nul_in = unsafe {
+        CreateFileW(
+            nul_wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &nul_sa as *const _ as *const c_void,
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if nul_in.is_null() || nul_in == (-1isize as *mut c_void) {
+        return Err(io::Error::last_os_error()).context("Failed to open NUL for child stdin");
+    }
+
+    if unsafe { CreatePipe(&mut stdout_read, &mut stdout_write, std::ptr::null(), 0) } == 0 {
+        unsafe { CloseHandle(nul_in); }
+        return Err(io::Error::last_os_error()).context("CreatePipe stdout failed");
+    }
+    if unsafe { CreatePipe(&mut stderr_read, &mut stderr_write, std::ptr::null(), 0) } == 0 {
+        unsafe {
+            CloseHandle(nul_in);
+            CloseHandle(stdout_read);
+            CloseHandle(stdout_write);
+        }
+        return Err(io::Error::last_os_error()).context("CreatePipe stderr failed");
+    }
+
+    unsafe {
+        SetHandleInformation(stdout_write, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        SetHandleInformation(stderr_write, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0);
+    }
+
+    let mut handles_to_inherit = [nul_in, stdout_write, stderr_write];
+    let mut attr_size: usize = 0;
+    unsafe {
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
+    }
+    let mut attr_buf = vec![0u8; attr_size];
+    let attr_list = attr_buf.as_mut_ptr() as *mut c_void;
+
+    if unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) } == 0 {
+        unsafe {
+            CloseHandle(nul_in);
+            CloseHandle(stdout_read);
+            CloseHandle(stdout_write);
+            CloseHandle(stderr_read);
+            CloseHandle(stderr_write);
+        }
+        return Err(io::Error::last_os_error()).context("InitializeProcThreadAttributeList failed");
+    }
+
+    if unsafe {
+        UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            handles_to_inherit.as_mut_ptr() as *mut c_void,
+            std::mem::size_of_val(&handles_to_inherit),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        unsafe {
+            DeleteProcThreadAttributeList(attr_list);
+            CloseHandle(nul_in);
+            CloseHandle(stdout_read);
+            CloseHandle(stdout_write);
+            CloseHandle(stderr_read);
+            CloseHandle(stderr_write);
+        }
+        return Err(io::Error::last_os_error()).context("UpdateProcThreadAttribute failed");
+    }
+
+    let mut si_ex: StartupInfoExW = unsafe { std::mem::zeroed() };
+    si_ex.startup_info.cb = std::mem::size_of::<StartupInfoExW>() as u32;
+    si_ex.startup_info.dw_flags = STARTF_USESTDHANDLES;
+    si_ex.startup_info.h_std_input = nul_in;
+    si_ex.startup_info.h_std_output = stdout_write;
+    si_ex.startup_info.h_std_error = stderr_write;
+    si_ex.lp_attribute_list = attr_list;
+
+    let app_wide: Vec<u16> = exe_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut cmd_parts = vec![quote_win32_arg(&exe_path.to_string_lossy())];
+    for a in args {
+        cmd_parts.push(quote_win32_arg(a));
+    }
+    let mut cmd_wide: Vec<u16> = OsStr::new(&cmd_parts.join(" "))
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut env_wide = build_scrubbed_unicode_env();
+    let cwd_wide: Option<Vec<u16>> = cwd.map(|d| {
+        d.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    });
+
+    let mut pi: ProcessInformation = unsafe { std::mem::zeroed() };
+    let created = unsafe {
+        CreateProcessW(
+            app_wide.as_ptr(),
+            cmd_wide.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            1, // bInheritHandles = TRUE (restricted via PROC_THREAD_ATTRIBUTE_HANDLE_LIST)
+            CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            env_wide.as_mut_ptr() as *mut c_void,
+            cwd_wide.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+            &mut si_ex as *mut _ as *mut c_void,
+            &mut pi,
+        )
+    };
+
+    unsafe {
+        DeleteProcThreadAttributeList(attr_list);
+        CloseHandle(nul_in);
+        CloseHandle(stdout_write);
+        CloseHandle(stderr_write);
+    }
+
+    if created == 0 {
+        unsafe {
+            CloseHandle(stdout_read);
+            CloseHandle(stderr_read);
+        }
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("Failed to spawn binary: {:?}", exe_path));
+    }
+
+    if let Err(e) = unsafe { job.assign_process(pi.h_process) } {
+        unsafe {
+            TerminateProcess(pi.h_process, 1);
+            CloseHandle(pi.h_process);
+            CloseHandle(pi.h_thread);
+            CloseHandle(stdout_read);
+            CloseHandle(stderr_read);
+        }
+        return Err(e).context("Failed to assign suspended child process to Job Object");
+    }
+
+    if let Err(e) = before_resume_hook(pi.h_process) {
+        unsafe {
+            TerminateProcess(pi.h_process, 1);
+            CloseHandle(pi.h_process);
+            CloseHandle(pi.h_thread);
+            CloseHandle(stdout_read);
+            CloseHandle(stderr_read);
+        }
+        return Err(e);
+    }
+
+    unsafe {
+        ResumeThread(pi.h_thread);
+        CloseHandle(pi.h_thread);
+    }
+
+    let stdout_file = unsafe { std::fs::File::from_raw_handle(stdout_read) };
+    let stderr_file = unsafe { std::fs::File::from_raw_handle(stderr_read) };
+
+    Ok(SpawnedSuspendedProcess {
+        process_handle: OwnedWinHandle(pi.h_process),
+        stdout_file,
+        stderr_file,
+    })
+}
+
+/// Executes an allowlisted binary in the Windows Job Object sandbox with `CREATE_SUSPENDED`
+/// pre-execution job assignment, scrubbed environment, and strictly zero shell interpolation.
 pub async fn execute_allowlisted(
     program: &str,
     args: &[String],
@@ -334,40 +734,53 @@ pub async fn execute_allowlisted(
     const MAX_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
     let job = JobObjectGuard::new(Some(MAX_MEMORY_BYTES))?;
 
-    let mut cmd = tokio::process::Command::new(&resolved_path);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    // Scrub dangerous injection environment variables
-    for var in DANGEROUS_ENV_VARS {
-        cmd.env_remove(var);
-    }
-
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-
     let start = Instant::now();
-    let child = cmd.spawn().with_context(|| format!("Failed to spawn binary: {:?}", resolved_path))?;
+    let spawned = spawn_suspended_assign_and_resume(&resolved_path, args, cwd, &job, |_| Ok(()))?;
 
-    if let Some(raw_handle) = child.raw_handle() {
-        unsafe { job.assign_process(raw_handle)?; }
-    }
+    let mut stdout_file = spawned.stdout_file;
+    let mut stderr_file = spawned.stderr_file;
+    let proc_handle = spawned.process_handle;
 
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => {
+    let wait_future = tokio::task::spawn_blocking(move || -> io::Result<(Option<i32>, Vec<u8>, Vec<u8>)> {
+        let stdout_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout_file.read_to_end(&mut buf);
+            buf
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr_file.read_to_end(&mut buf);
+            buf
+        });
+
+        unsafe {
+            WaitForSingleObject(proc_handle.as_raw(), INFINITE);
+        }
+        let mut exit_code: u32 = 0;
+        let code_opt = if unsafe { GetExitCodeProcess(proc_handle.as_raw(), &mut exit_code) } != 0 {
+            Some(exit_code as i32)
+        } else {
+            None
+        };
+
+        let out_bytes = stdout_reader.join().unwrap_or_default();
+        let err_bytes = stderr_reader.join().unwrap_or_default();
+        Ok((code_opt, out_bytes, err_bytes))
+    });
+
+    match tokio::time::timeout(timeout, wait_future).await {
+        Ok(Ok(Ok((exit_code, out_bytes, err_bytes)))) => {
             let duration_ms = start.elapsed().as_millis() as u64;
             Ok(GuardedCommandOutput {
-                exit_code: output.status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                exit_code,
+                stdout: String::from_utf8_lossy(&out_bytes).trim().to_string(),
+                stderr: String::from_utf8_lossy(&err_bytes).trim().to_string(),
                 duration_ms,
                 timed_out: false,
             })
         }
-        Ok(Err(err)) => Err(anyhow::anyhow!("Process execution error: {err}")),
+        Ok(Ok(Err(err))) => Err(anyhow::anyhow!("Process execution error: {err}")),
+        Ok(Err(join_err)) => Err(anyhow::anyhow!("Process wait task failed: {join_err}")),
         Err(_) => {
             // Timeout fired! Dropping `job` triggers JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             // forcefully terminating the entire child process tree.
@@ -402,6 +815,14 @@ pub async fn run_guarded_command(
 mod tests {
     use super::*;
 
+    extern "system" {
+        fn IsProcessInJob(
+            ProcessHandle: *mut c_void,
+            JobHandle: *mut c_void,
+            Result: *mut i32,
+        ) -> i32;
+    }
+
     #[tokio::test]
     async fn test_guarded_command_success() {
         // Runs allowlisted git --version with zero shell interpolation
@@ -420,18 +841,18 @@ mod tests {
         let job = JobObjectGuard::new(Some(1024 * 1024 * 1024)).expect("job created");
         let mut py_cmd = tokio::process::Command::new("python.exe");
         py_cmd.args(["-c", "import time; time.sleep(10)"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
 
         let child = match py_cmd.spawn() {
             Ok(c) => c,
             Err(_) => {
                 let mut ping_cmd = tokio::process::Command::new("ping.exe");
                 ping_cmd.args(["127.0.0.1", "-n", "10"])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
                 ping_cmd.spawn().expect("ping spawned")
             }
         };
@@ -482,5 +903,49 @@ mod tests {
         // rustc arbitrary compilation blocked
         let args_rustc = vec!["main.rs".to_string(), "-o".to_string(), "evil.exe".to_string()];
         assert!(validate_binary_arguments("rustc", &args_rustc).is_err());
+    }
+
+    #[test]
+    fn test_resolve_allowlisted_binary_rejects_temp_path() {
+        let temp_exe = std::env::temp_dir().join("git.exe");
+        let _ = std::fs::write(&temp_exe, b"fake");
+        let res = resolve_allowlisted_binary(temp_exe.to_str().unwrap());
+        let _ = std::fs::remove_file(&temp_exe);
+        assert!(res.is_err(), "Explicit path inside %TEMP% must be rejected");
+    }
+
+    #[test]
+    fn test_create_suspended_assigns_job_before_resume() {
+        let resolved = resolve_allowlisted_binary("git").expect("git found");
+        let job = JobObjectGuard::new(Some(1024 * 1024 * 1024)).expect("job created");
+        let mut verified_in_job_before_resume = false;
+
+        let spawned = spawn_suspended_assign_and_resume(
+            &resolved,
+            &["--version".to_string()],
+            None,
+            &job,
+            |proc_handle| {
+                let mut in_job: i32 = 0;
+                let ok = unsafe { IsProcessInJob(proc_handle, job.raw_handle(), &mut in_job) };
+                anyhow::ensure!(ok != 0, "IsProcessInJob call failed");
+                anyhow::ensure!(
+                    in_job != 0,
+                    "Child process must already be assigned to Job Object before ResumeThread"
+                );
+                verified_in_job_before_resume = true;
+                Ok(())
+            },
+        )
+        .expect("spawn_suspended_assign_and_resume succeeded");
+
+        assert!(verified_in_job_before_resume);
+        unsafe {
+            WaitForSingleObject(spawned.process_handle.0, INFINITE);
+        }
+        let mut out = String::new();
+        let mut f = spawned.stdout_file;
+        let _ = f.read_to_string(&mut out);
+        assert!(out.to_lowercase().contains("git version"));
     }
 }

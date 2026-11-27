@@ -1,5 +1,5 @@
 #include <algorithm>
-#include <cassert>
+#include "test_assert.hpp"
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -20,56 +20,56 @@ void TestStateMachineLogic() {
     listener.SetOnHotkeyUp([&up_count]() { up_count++; });
 
     // 1. Initial state: inactive
-    assert(!listener.IsHotkeyActive());
-    assert(down_count == 0 && up_count == 0);
+    TEST_ASSERT(!listener.IsHotkeyActive());
+    TEST_ASSERT(down_count == 0 && up_count == 0);
 
     // 2. Space alone: no trigger
     listener.ProcessRawKey(VK_SPACE, RI_KEY_MAKE, 0x39);
-    assert(!listener.IsHotkeyActive());
-    assert(down_count == 0 && up_count == 0);
+    TEST_ASSERT(!listener.IsHotkeyActive());
+    TEST_ASSERT(down_count == 0 && up_count == 0);
 
     listener.ProcessRawKey(VK_SPACE, RI_KEY_BREAK, 0x39);
-    assert(!listener.IsHotkeyActive());
-    assert(down_count == 0 && up_count == 0);
+    TEST_ASSERT(!listener.IsHotkeyActive());
+    TEST_ASSERT(down_count == 0 && up_count == 0);
 
     // 3. Left Ctrl alone: no trigger
     listener.ProcessRawKey(VK_CONTROL, RI_KEY_MAKE, 0x1D);
-    assert(!listener.IsHotkeyActive());
-    assert(down_count == 0 && up_count == 0);
+    TEST_ASSERT(!listener.IsHotkeyActive());
+    TEST_ASSERT(down_count == 0 && up_count == 0);
 
     // 4. Ctrl + Space: triggers OnHotkeyDown ONCE
     bool triggered = listener.ProcessRawKey(VK_SPACE, RI_KEY_MAKE, 0x39);
-    assert(triggered);
-    assert(listener.IsHotkeyActive());
-    assert(down_count == 1 && up_count == 0);
+    TEST_ASSERT(triggered);
+    TEST_ASSERT(listener.IsHotkeyActive());
+    TEST_ASSERT(down_count == 1 && up_count == 0);
 
     // 5. Repeated Space auto-repeat (RI_KEY_MAKE while held): must NOT re-fire
     for (int i = 0; i < 5; ++i) {
         bool re_trigger = listener.ProcessRawKey(VK_SPACE, RI_KEY_MAKE, 0x39);
-        assert(!re_trigger);
-        assert(listener.IsHotkeyActive());
-        assert(down_count == 1 && up_count == 0);
+        TEST_ASSERT(!re_trigger);
+        TEST_ASSERT(listener.IsHotkeyActive());
+        TEST_ASSERT(down_count == 1 && up_count == 0);
     }
 
     // 6. Release Space: triggers OnHotkeyUp ONCE and resets hotkey_active_
     listener.ProcessRawKey(VK_SPACE, RI_KEY_BREAK, 0x39);
-    assert(!listener.IsHotkeyActive());
-    assert(down_count == 1 && up_count == 1);
+    TEST_ASSERT(!listener.IsHotkeyActive());
+    TEST_ASSERT(down_count == 1 && up_count == 1);
 
     // 7. Re-press Space while Ctrl still held: triggers OnHotkeyDown again
     triggered = listener.ProcessRawKey(VK_SPACE, RI_KEY_MAKE, 0x39);
-    assert(triggered);
-    assert(listener.IsHotkeyActive());
-    assert(down_count == 2 && up_count == 1);
+    TEST_ASSERT(triggered);
+    TEST_ASSERT(listener.IsHotkeyActive());
+    TEST_ASSERT(down_count == 2 && up_count == 1);
 
     // 8. Release Ctrl while Space held: triggers OnHotkeyUp
     listener.ProcessRawKey(VK_CONTROL, RI_KEY_BREAK, 0x1D);
-    assert(!listener.IsHotkeyActive());
-    assert(down_count == 2 && up_count == 2);
+    TEST_ASSERT(!listener.IsHotkeyActive());
+    TEST_ASSERT(down_count == 2 && up_count == 2);
 
     listener.ProcessRawKey(VK_SPACE, RI_KEY_BREAK, 0x39);
-    assert(!listener.IsHotkeyActive());
-    assert(down_count == 2 && up_count == 2);
+    TEST_ASSERT(!listener.IsHotkeyActive());
+    TEST_ASSERT(down_count == 2 && up_count == 2);
 
     // 9. Dual-Ctrl overlap hygiene: hold Left Ctrl + Right Ctrl, release one
     listener.ResetState();
@@ -82,24 +82,24 @@ void TestStateMachineLogic() {
     listener.ProcessRawKey(VK_CONTROL, RI_KEY_MAKE | RI_KEY_E0, 0x1D);
     // Press Space -> Active!
     triggered = listener.ProcessRawKey(VK_SPACE, RI_KEY_MAKE, 0x39);
-    assert(triggered);
-    assert(listener.IsHotkeyActive());
-    assert(down_count == 1 && up_count == 0);
+    TEST_ASSERT(triggered);
+    TEST_ASSERT(listener.IsHotkeyActive());
+    TEST_ASSERT(down_count == 1 && up_count == 0);
 
     // Release Left Ctrl: Right Ctrl is still down, so hotkey stays active
     listener.ProcessRawKey(VK_CONTROL, RI_KEY_BREAK, 0x1D);
-    assert(listener.IsHotkeyActive());
-    assert(down_count == 1 && up_count == 0);
+    TEST_ASSERT(listener.IsHotkeyActive());
+    TEST_ASSERT(down_count == 1 && up_count == 0);
 
     // Release Right Ctrl: both Ctrls now released -> triggers OnHotkeyUp!
     listener.ProcessRawKey(VK_CONTROL, RI_KEY_BREAK | RI_KEY_E0, 0x1D);
-    assert(!listener.IsHotkeyActive());
-    assert(down_count == 1 && up_count == 1);
+    TEST_ASSERT(!listener.IsHotkeyActive());
+    TEST_ASSERT(down_count == 1 && up_count == 1);
 
     // Clean release of Space
     listener.ProcessRawKey(VK_SPACE, RI_KEY_BREAK, 0x39);
-    assert(!listener.IsHotkeyActive());
-    assert(down_count == 1 && up_count == 1);
+    TEST_ASSERT(!listener.IsHotkeyActive());
+    TEST_ASSERT(down_count == 1 && up_count == 1);
 }
 
 void TestHudThreadStallIsolation() {
@@ -168,8 +168,8 @@ void TestHudThreadStallIsolation() {
     });
 
     bool started = listener.Start();
-    assert(started);
-    assert(listener.IsRunning());
+    TEST_ASSERT(started);
+    TEST_ASSERT(listener.IsRunning());
 
     // 3. Freeze the simulated HUD thread for 1,500 ms (> 1,000 ms hook timeout ceiling)
     hud_is_stalled.store(true, std::memory_order_release);
@@ -181,7 +181,7 @@ void TestHudThreadStallIsolation() {
     // Ctrl down -> Space down
     listener.ProcessRawKey(VK_CONTROL, RI_KEY_MAKE, 0x1D);
     bool down_trig = listener.ProcessRawKey(VK_SPACE, RI_KEY_MAKE, 0x39);
-    assert(down_trig);
+    TEST_ASSERT(down_trig);
 
     const auto t_end = std::chrono::high_resolution_clock::now();
     const double callback_latency_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
@@ -190,9 +190,9 @@ void TestHudThreadStallIsolation() {
               << callback_latency_ms << " ms" << std::endl;
 
     // Requirement: input dispatch must never be blocked by frozen HUD thread (strictly < 5 ms)
-    assert(callback_latency_ms < 5.0);
-    assert(callback_count.load() == 1);
-    assert(listener.IsRunning());
+    TEST_ASSERT(callback_latency_ms < 5.0);
+    TEST_ASSERT(callback_count.load() == 1);
+    TEST_ASSERT(listener.IsRunning());
 
     // Release keys
     listener.ProcessRawKey(VK_SPACE, RI_KEY_BREAK, 0x39);
@@ -205,11 +205,11 @@ void TestHudThreadStallIsolation() {
     // Give message loop time to pump queued PostMessageW
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    assert(received_triggers.load() == 1);
+    TEST_ASSERT(received_triggers.load() == 1);
 
     // 6. Clean teardown
     listener.Stop();
-    assert(!listener.IsRunning());
+    TEST_ASSERT(!listener.IsRunning());
 
     hud_thread_running.store(false, std::memory_order_release);
     hud_thread.join();
@@ -231,26 +231,26 @@ void TestPttUtteranceThresholds() {
 
     // 1. Short utterance (100 ms, 1600 samples) with loud speech -> Rejected
     std::vector<float> short_audio(1600, 0.25f);
-    assert(!eval_ptt(short_audio));
+    TEST_ASSERT(!eval_ptt(short_audio));
 
     // 2. Long utterance (500 ms, 8000 samples) with pure silence (0.0f) -> Rejected (silent PTT release resets HUD)
     std::vector<float> silent_audio(8000, 0.0f);
-    assert(!eval_ptt(silent_audio));
+    TEST_ASSERT(!eval_ptt(silent_audio));
 
     // 3. Long utterance (500 ms, 8000 samples) with near-zero noise below threshold (0.00005f) -> Rejected
     std::vector<float> near_zero(8000, 0.00005f);
-    assert(!eval_ptt(near_zero));
+    TEST_ASSERT(!eval_ptt(near_zero));
 
     // 4. Valid utterance (500 ms, 8000 samples) with audible speech (RMS >= 0.0001f) -> Accepted (HUD thinking & dispatched)
     std::vector<float> speech_audio(8000);
     for (size_t i = 0; i < 8000; ++i) {
         speech_audio[i] = 0.1f * std::sin(2.0f * 3.14159265f * 440.0f * static_cast<float>(i) / 16000.0f);
     }
-    assert(eval_ptt(speech_audio));
+    TEST_ASSERT(eval_ptt(speech_audio));
 
     // 5. Bare minimum valid threshold (250 ms = 4000 samples @ 16 kHz) with threshold RMS -> Accepted
     std::vector<float> min_audio(4000, 0.0002f);
-    assert(eval_ptt(min_audio));
+    TEST_ASSERT(eval_ptt(min_audio));
 }
 
 int main() {

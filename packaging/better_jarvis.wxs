@@ -35,14 +35,26 @@
         <File Id="JarvisDaemonExe" Source="..\dist\Better_Jarvis-v1.0.0-win64\jarvis-daemon.exe" KeyPath="yes" />
       </Component>
 
+      <Component Id="RootManifestAndDocs" Guid="8E9A74C1-3F5D-4A28-9B41-7C8A9D01E3F4">
+        <File Id="ManifestSha256" Source="..\dist\Better_Jarvis-v1.0.0-win64\manifest.sha256" KeyPath="yes" />
+        <File Id="ReadmeTxt" Source="..\dist\Better_Jarvis-v1.0.0-win64\README.txt" />
+      </Component>
+
       <Component Id="ApplicationShortcutRef" Guid="6A1A7FE2-C84C-485F-82D1-79A81E482FB9">
         <RemoveFolder Id="CleanUpProgramMenuDir" Directory="ApplicationProgramsFolder" On="uninstall" />
         <RegistryValue Root="HKCU" Key="Software\Better_Jarvis" Name="installed" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </ComponentGroup>
 
+    <ComponentGroup Id="ConfigComponents" Directory="INSTALLFOLDER">
+      <Files Include="..\dist\Better_Jarvis-v1.0.0-win64\config\**" Subdirectory="config" />
+      <Files Include="..\dist\Better_Jarvis-v1.0.0-win64\scripts\**" Subdirectory="scripts" />
+      <Files Include="..\dist\Better_Jarvis-v1.0.0-win64\espeak-ng-data\**" Subdirectory="espeak-ng-data" />
+    </ComponentGroup>
+
     <Feature Id="MainApplication" Title="Better_Jarvis Application" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
+      <ComponentGroupRef Id="ConfigComponents" />
       <Files Include="..\dist\Better_Jarvis-v1.0.0-win64\*.dll" />
     </Feature>
   </Package>

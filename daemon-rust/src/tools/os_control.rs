@@ -1,6 +1,7 @@
 use anyhow::Result;
 use futures::future::BoxFuture;
 use std::ffi::c_void;
+use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
@@ -82,11 +83,126 @@ pub const ALLOWED_DESKTOP_APPS: &[&str] = &[
     "calculator", "calc", "calc.exe",
     "terminal", "wt", "wt.exe",
     "spotify", "spotify:",
+    "discord", "discord:",
     "settings", "windows settings", "ms-settings:",
     "explorer",
     "code",
     "chrome",
 ];
+
+fn resolve_system_root_binary(rel_path: &str) -> Result<PathBuf> {
+    let sys_root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let candidate = sys_root.join(rel_path);
+    if candidate.is_file() {
+        Ok(candidate)
+    } else {
+        anyhow::bail!("System binary not found at {}", candidate.display())
+    }
+}
+
+fn resolve_first_existing_candidate(candidates: &[PathBuf], label: &str) -> Result<PathBuf> {
+    for path in candidates {
+        if path.is_file() {
+            return Ok(path.clone());
+        }
+    }
+    anyhow::bail!("Allowlisted desktop application '{}' not found at trusted install locations", label)
+}
+
+fn resolve_trusted_path_exe(exe_name: &str) -> Option<PathBuf> {
+    let current_dir = std::env::current_dir().ok();
+    let temp_dir = std::env::temp_dir();
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() || dir == Path::new(".") || !dir.is_absolute() {
+            continue;
+        }
+        if let Some(ref cwd) = current_dir {
+            if dir == *cwd {
+                continue;
+            }
+        }
+        if dir.starts_with(&temp_dir) {
+            continue;
+        }
+        let candidate = dir.join(exe_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Resolves an allowlisted desktop application target to a verified absolute executable path
+/// and explicit zero-shell argument vector.
+pub fn resolve_desktop_app_command(target: &str) -> Result<(PathBuf, Vec<String>)> {
+    let trimmed = target.trim();
+    validate_launch_target(trimmed)?;
+
+    let lower = trimmed.to_lowercase();
+    match lower.as_str() {
+        "notepad" | "notepad.exe" => {
+            Ok((resolve_system_root_binary(r"System32\notepad.exe")?, Vec::new()))
+        }
+        "calculator" | "calc" | "calc.exe" => {
+            Ok((resolve_system_root_binary(r"System32\calc.exe")?, Vec::new()))
+        }
+        "explorer" => {
+            Ok((resolve_system_root_binary("explorer.exe")?, Vec::new()))
+        }
+        "spotify" | "spotify:" => {
+            Ok((resolve_system_root_binary("explorer.exe")?, vec!["spotify:".to_string()]))
+        }
+        "discord" | "discord:" => {
+            Ok((resolve_system_root_binary("explorer.exe")?, vec!["discord:".to_string()]))
+        }
+        "settings" | "windows settings" | "ms-settings:" => {
+            Ok((resolve_system_root_binary("explorer.exe")?, vec!["ms-settings:".to_string()]))
+        }
+        "terminal" | "wt" | "wt.exe" => {
+            let mut candidates = Vec::new();
+            if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                candidates.push(Path::new(&local_app_data).join(r"Microsoft\WindowsApps\wt.exe"));
+            }
+            if let Some(path_hit) = resolve_trusted_path_exe("wt.exe") {
+                candidates.push(path_hit);
+            }
+            Ok((resolve_first_existing_candidate(&candidates, "Windows Terminal")?, Vec::new()))
+        }
+        "code" => {
+            let mut candidates = Vec::new();
+            if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                candidates.push(Path::new(&local_app_data).join(r"Programs\Microsoft VS Code\Code.exe"));
+            }
+            if let Ok(prog_files) = std::env::var("ProgramFiles") {
+                candidates.push(Path::new(&prog_files).join(r"Microsoft VS Code\Code.exe"));
+            }
+            if let Ok(prog_files_x86) = std::env::var("ProgramFiles(x86)") {
+                candidates.push(Path::new(&prog_files_x86).join(r"Microsoft VS Code\Code.exe"));
+            }
+            Ok((resolve_first_existing_candidate(&candidates, "Visual Studio Code")?, Vec::new()))
+        }
+        "chrome" => {
+            let mut candidates = Vec::new();
+            if let Ok(prog_files) = std::env::var("ProgramFiles") {
+                candidates.push(Path::new(&prog_files).join(r"Google\Chrome\Application\chrome.exe"));
+            }
+            if let Ok(prog_files_x86) = std::env::var("ProgramFiles(x86)") {
+                candidates.push(Path::new(&prog_files_x86).join(r"Google\Chrome\Application\chrome.exe"));
+            }
+            if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                candidates.push(Path::new(&local_app_data).join(r"Google\Chrome\Application\chrome.exe"));
+            }
+            Ok((resolve_first_existing_candidate(&candidates, "Google Chrome")?, Vec::new()))
+        }
+        other => {
+            anyhow::bail!("Target '{}' is not an allowed application", other);
+        }
+    }
+}
 
 /// Validates that an app launch target matches the strict allowlist of benign desktop applications.
 pub fn validate_launch_target(target: &str) -> Result<()> {
@@ -245,44 +361,10 @@ impl Win32StaOsController {
     }
 
     fn sync_execute_launch_target(target: &str) -> Result<()> {
-        let trimmed = target.trim();
-        validate_launch_target(trimmed)?;
-
-        let lower = trimmed.to_lowercase();
-        match lower.as_str() {
-            "notepad" | "notepad.exe" => {
-                std::process::Command::new("notepad.exe").spawn()?;
-            }
-            "calculator" | "calc" | "calc.exe" => {
-                std::process::Command::new("calc.exe").spawn()?;
-            }
-            "terminal" | "wt" | "wt.exe" => {
-                std::process::Command::new("wt.exe").spawn()?;
-            }
-            "spotify" | "spotify:" => {
-                std::process::Command::new("explorer.exe")
-                    .arg("spotify:")
-                    .spawn()?;
-            }
-            "settings" | "windows settings" | "ms-settings:" => {
-                std::process::Command::new("explorer.exe")
-                    .arg("ms-settings:")
-                    .spawn()?;
-            }
-            "explorer" => {
-                std::process::Command::new("explorer.exe").spawn()?;
-            }
-            "code" => {
-                std::process::Command::new("code.cmd").spawn()?;
-            }
-            "chrome" => {
-                std::process::Command::new("chrome.exe").spawn()?;
-            }
-            other => {
-                anyhow::bail!("Target '{}' is not an allowed application", other);
-            }
-        }
-
+        let (exe_path, args) = resolve_desktop_app_command(target)?;
+        std::process::Command::new(&exe_path)
+            .args(&args)
+            .spawn()?;
         Ok(())
     }
 }
@@ -401,7 +483,26 @@ mod tests {
         assert!(validate_launch_target("notepad").is_ok());
         assert!(validate_launch_target("calc").is_ok());
         assert!(validate_launch_target("spotify").is_ok());
+        assert!(validate_launch_target("discord").is_ok());
+        assert!(validate_launch_target("discord:").is_ok());
         assert!(validate_launch_target("terminal").is_ok());
         assert!(validate_launch_target("settings").is_ok());
+    }
+
+    #[test]
+    fn test_resolve_desktop_app_commands_are_absolute_and_non_batch() {
+        for target in ["notepad", "calc", "explorer", "spotify:", "discord:", "ms-settings:"] {
+            let (exe, _args) = resolve_desktop_app_command(target)
+                .unwrap_or_else(|e| panic!("Expected '{}' to resolve cleanly: {}", target, e));
+            assert!(exe.is_absolute(), "Resolved path for '{}' must be absolute: {:?}", target, exe);
+            let ext = exe.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            assert_eq!(ext, "exe", "Desktop app '{}' must resolve to .exe, not batch/script", target);
+        }
+
+        if let Ok((code_exe, _)) = resolve_desktop_app_command("code") {
+            assert!(code_exe.is_absolute());
+            let fname = code_exe.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+            assert_eq!(fname, "code.exe", "VS Code must never resolve to code.cmd");
+        }
     }
 }

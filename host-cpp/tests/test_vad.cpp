@@ -1,4 +1,4 @@
-#include <cassert>
+#include "test_assert.hpp"
 #include <cmath>
 #include <filesystem>
 #include <iostream>
@@ -49,11 +49,11 @@ void TestSilenceDoesNotTriggerSpeech() {
     for (int i = 0; i < 30; ++i) {
         ring_buffer.PushBatch(silence.data(), silence.size());
         bool processed = vad.ProcessNextFrame();
-        assert(processed);
-        assert(!vad.IsInSpeech());
+        TEST_ASSERT(processed);
+        TEST_ASSERT(!vad.IsInSpeech());
     }
 
-    assert(!utterance_fired);
+    TEST_ASSERT(!utterance_fired);
 }
 
 void TestSpeechOnsetPreRollAndEndpointing() {
@@ -75,14 +75,14 @@ void TestSpeechOnsetPreRollAndEndpointing() {
         ring_buffer.PushBatch(silence.data(), silence.size());
         vad.ProcessNextFrame();
     }
-    assert(!vad.IsInSpeech());
+    TEST_ASSERT(!vad.IsInSpeech());
 
     // 2. Feed 10 frames of speech
     for (int i = 0; i < 10; ++i) {
         ring_buffer.PushBatch(speech.data(), speech.size());
         vad.ProcessNextFrame();
     }
-    assert(vad.IsInSpeech());
+    TEST_ASSERT(vad.IsInSpeech());
 
     // 3. Feed 22 frames of trailing silence to trigger SPEECH_END (> 21 frames)
     for (int i = 0; i < 22; ++i) {
@@ -90,13 +90,13 @@ void TestSpeechOnsetPreRollAndEndpointing() {
         vad.ProcessNextFrame();
     }
 
-    assert(!vad.IsInSpeech());
-    assert(callbacks_count == 1);
+    TEST_ASSERT(!vad.IsInSpeech());
+    TEST_ASSERT(callbacks_count == 1);
 
     // Utterance must contain pre-roll + speech frames
     // 800 ms pre-roll = 12,800 samples + 10 speech frames * 512 = 5,120 samples
-    assert(!received_utterance.empty());
-    assert(received_utterance.size() >= 12800);
+    TEST_ASSERT(!received_utterance.empty());
+    TEST_ASSERT(received_utterance.size() >= 12800);
 }
 
 void TestMaxUtteranceCap() {
@@ -120,8 +120,8 @@ void TestMaxUtteranceCap() {
     }
 
     // Safety cap must have fired
-    assert(callbacks_count == 1);
-    assert(!vad.IsInSpeech());
+    TEST_ASSERT(callbacks_count == 1);
+    TEST_ASSERT(!vad.IsInSpeech());
 }
 
 void TestRealOnnxVad() {
@@ -141,12 +141,12 @@ void TestRealOnnxVad() {
 
     SpscRingBuffer<32768> ring_buffer;
     SileroVad vad(ring_buffer, model_path.wstring());
-    assert(vad.IsOnnxLoaded());
+    TEST_ASSERT(vad.IsOnnxLoaded());
 
     auto silence = GenerateSilenceFrame();
     for (int i = 0; i < 100; ++i) {
         float prob = vad.EvaluateFrame(silence.data());
-        assert(prob < 0.15f);
+        TEST_ASSERT(prob < 0.15f);
     }
     std::cout << "  [test_vad] Real Silero VAD ONNX verified (100 silence frames < 0.15)" << std::endl;
 }

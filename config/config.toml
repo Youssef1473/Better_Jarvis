@@ -33,8 +33,16 @@ project_id = ""
 location = "global"
 allow_metadata_service = false
 
+[ai.local_fallback]
+enabled = true
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "qwen3.5:2b"
+max_output_tokens = 4096
+timeout_secs = 60
+
 [security]
 allowed_directories = [
-    "C:\\Users\\Youssef\\Projects",
-    "C:\\Users\\Youssef\\Documents"
+    "%USERPROFILE%\\Projects",
+    "%USERPROFILE%\\Documents"
 ]

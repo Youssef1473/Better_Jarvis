@@ -1,6 +1,6 @@
 #include "diagnostics/crash_handler.hpp"
 
-#include <cassert>
+#include "test_assert.hpp"
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -18,17 +18,17 @@ void TestDirectoryCreationAndDumpHeader() {
     fs::remove_all(temp_crash_dir, ec);
 
     std::wstring dump_path = jarvis::diagnostics::WriteDiagnosticDump(temp_crash_dir.wstring());
-    assert(!dump_path.empty() && "WriteDiagnosticDump must return non-empty path");
-    assert(fs::exists(dump_path) && "Generated dump file must exist on disk");
+    TEST_ASSERT(!dump_path.empty() && "WriteDiagnosticDump must return non-empty path");
+    TEST_ASSERT(fs::exists(dump_path) && "Generated dump file must exist on disk");
 
     // Verify MDMP Magic Header (0x4D 0x44 0x4D 0x50 = "MDMP")
     std::ifstream dump_file(fs::path(dump_path), std::ios::binary);
-    assert(dump_file.is_open() && "Must be able to open dump file in binary mode");
+    TEST_ASSERT(dump_file.is_open() && "Must be able to open dump file in binary mode");
 
     char header[4]{};
     dump_file.read(header, 4);
-    assert(dump_file.gcount() == 4 && "Must read at least 4 header bytes");
-    assert(header[0] == 'M' && header[1] == 'D' && header[2] == 'M' && header[3] == 'P' &&
+    TEST_ASSERT(dump_file.gcount() == 4 && "Must read at least 4 header bytes");
+    TEST_ASSERT(header[0] == 'M' && header[1] == 'D' && header[2] == 'M' && header[3] == 'P' &&
            "Dump header must match MDMP magic signature (0x504D444D)");
 
     std::cout << "  [PASS] MDMP signature verified: " << header[0] << header[1] << header[2] << header[3] << "\n";
@@ -65,7 +65,7 @@ void TestRetentionPruning() {
     for (const auto& entry : fs::directory_iterator(temp_crash_dir, ec)) {
         if (entry.path().extension() == ".dmp") initial_count++;
     }
-    assert(initial_count == 8 && "Must have created exactly 8 dummy dump files");
+    TEST_ASSERT(initial_count == 8 && "Must have created exactly 8 dummy dump files");
 
     // Prune to 5
     jarvis::diagnostics::PruneCrashDumps(temp_crash_dir.wstring(), 5);
@@ -74,14 +74,14 @@ void TestRetentionPruning() {
     for (const auto& entry : fs::directory_iterator(temp_crash_dir, ec)) {
         if (entry.path().extension() == ".dmp") post_prune_count++;
     }
-    assert(post_prune_count == 5 && "Pruning must retain strictly the 5 newest files");
+    TEST_ASSERT(post_prune_count == 5 && "Pruning must retain strictly the 5 newest files");
 
     // Verify oldest files (1, 2, 3) were pruned and newest (4, 5, 6, 7, 8) remain
-    assert(!fs::exists(dummy_files[0]) && "Oldest file 1 must be deleted");
-    assert(!fs::exists(dummy_files[1]) && "Oldest file 2 must be deleted");
-    assert(!fs::exists(dummy_files[2]) && "Oldest file 3 must be deleted");
-    assert(fs::exists(dummy_files[7]) && "Newest file 8 must be retained");
-    assert(fs::exists(dummy_files[6]) && "Newest file 7 must be retained");
+    TEST_ASSERT(!fs::exists(dummy_files[0]) && "Oldest file 1 must be deleted");
+    TEST_ASSERT(!fs::exists(dummy_files[1]) && "Oldest file 2 must be deleted");
+    TEST_ASSERT(!fs::exists(dummy_files[2]) && "Oldest file 3 must be deleted");
+    TEST_ASSERT(fs::exists(dummy_files[7]) && "Newest file 8 must be retained");
+    TEST_ASSERT(fs::exists(dummy_files[6]) && "Newest file 7 must be retained");
 
     std::cout << "  [PASS] Exactly 5 newest dumps retained out of 8.\n";
 

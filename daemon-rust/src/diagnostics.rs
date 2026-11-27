@@ -154,13 +154,13 @@ pub fn prune_panic_logs(crash_dir: &Path, max_keep: usize) {
 pub fn init_panic_hook(crash_dir: &Path) {
     let _ = fs::create_dir_all(crash_dir);
     {
-        let mut guard = CRASH_DIR.lock().unwrap();
+        let mut guard = CRASH_DIR.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(crash_dir.to_path_buf());
     }
 
     std::panic::set_hook(Box::new(|info| {
         let crash_dir = {
-            let guard = CRASH_DIR.lock().unwrap();
+            let guard = CRASH_DIR.lock().unwrap_or_else(|e| e.into_inner());
             guard.clone().unwrap_or_else(std::env::temp_dir)
         };
 

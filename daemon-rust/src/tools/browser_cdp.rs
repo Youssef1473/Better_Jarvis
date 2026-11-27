@@ -219,6 +219,34 @@ impl CdpSecurityGate {
         }
     }
 
+    fn is_forbidden_ipv4(ip: std::net::Ipv4Addr) -> bool {
+        let octets = ip.octets();
+        let is_cgnat = octets[0] == 100 && (octets[1] & 0xC0) == 64;
+        let is_this_network = octets[0] == 0;
+        ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            || ip.is_multicast()
+            || ip.is_documentation()
+            || is_cgnat
+            || is_this_network
+    }
+
+    fn is_forbidden_ipv6(ip: std::net::Ipv6Addr) -> bool {
+        if let Some(v4) = ip.to_ipv4_mapped() {
+            return Self::is_forbidden_ipv4(v4);
+        }
+        if let Some(v4) = ip.to_ipv4() {
+            return Self::is_forbidden_ipv4(v4);
+        }
+        let seg0 = ip.segments()[0];
+        let is_link_local = (seg0 & 0xffc0) == 0xfe80;
+        let is_ula = (seg0 & 0xfe00) == 0xfc00;
+        ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || is_link_local || is_ula
+    }
+
     pub fn validate_navigation_url(url: &str) -> Result<()> {
         let trimmed = url.trim();
         if trimmed.is_empty() {
@@ -231,11 +259,6 @@ impl CdpSecurityGate {
 
         let lower = trimmed.to_lowercase();
 
-        // Must strictly use http or https
-        if !lower.starts_with("https://") && !lower.starts_with("http://") {
-            anyhow::bail!("Unapproved URL protocol: must be https:// or http:// ({})", url);
-        }
-
         // Hard-reject dangerous schemes
         for &scheme in Self::DISALLOWED_URL_SCHEMES {
             if lower.starts_with(scheme) {
@@ -243,25 +266,59 @@ impl CdpSecurityGate {
             }
         }
 
-        // Parse host to reject loopback, internal IPs, and metadata services
-        let host_part = if let Some(after_scheme) = lower.split("://").nth(1) {
-            let authority = after_scheme.split('/').next().unwrap_or("");
-            if authority.starts_with('[') {
-                if let Some(end) = authority.find(']') {
-                    &authority[..=end]
-                } else {
-                    authority
-                }
-            } else {
-                authority.split(':').next().unwrap_or("")
-            }
-        } else {
-            ""
-        };
+        // Must strictly use http or https
+        if !lower.starts_with("https://") && !lower.starts_with("http://") {
+            anyhow::bail!("Unapproved URL protocol: must be https:// or http:// ({})", url);
+        }
 
-        for &disallowed in Self::DISALLOWED_HOSTS {
-            if host_part == disallowed || host_part == format!("[{}]", disallowed) {
-                anyhow::bail!("Navigation to private/loopback/metadata host is forbidden: {}", host_part);
+        // Reject any authority userinfo (`user@host` or `@host`) before path/query/fragment
+        if let Some(after_scheme) = lower.split("://").nth(1) {
+            let authority = after_scheme
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("");
+            if authority.contains('@') {
+                anyhow::bail!("URL userinfo (@) is forbidden in browser navigation: {}", url);
+            }
+        }
+
+        let parsed = reqwest::Url::parse(trimmed)
+            .with_context(|| format!("Invalid navigation URL: {}", url))?;
+
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            anyhow::bail!("Unapproved URL protocol: must be https:// or http:// ({})", url);
+        }
+
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            anyhow::bail!("URL userinfo credentials are forbidden: {}", url);
+        }
+
+        let raw_host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("Navigation URL missing host: {}", url))?;
+        let trimmed_host = raw_host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_lowercase();
+
+        if trimmed_host.is_empty()
+            || trimmed_host == "localhost"
+            || trimmed_host.ends_with(".localhost")
+            || trimmed_host.ends_with(".local")
+            || trimmed_host.ends_with(".internal")
+            || Self::DISALLOWED_HOSTS.contains(&trimmed_host.as_str())
+        {
+            anyhow::bail!("Navigation to private/loopback/metadata host is forbidden: {}", raw_host);
+        }
+
+        if let Ok(ip) = trimmed_host.parse::<std::net::IpAddr>() {
+            let forbidden = match ip {
+                std::net::IpAddr::V4(v4) => Self::is_forbidden_ipv4(v4),
+                std::net::IpAddr::V6(v6) => Self::is_forbidden_ipv6(v6),
+            };
+            if forbidden {
+                anyhow::bail!("Navigation to private/loopback/metadata IP host is forbidden: {}", raw_host);
             }
         }
 
@@ -802,19 +859,21 @@ impl ManagedCdpBrowser {
         Ok(())
     }
 
-    /// Evaluates `document.title` and `location.href` in the managed tab, wrapping in nonced untrusted tags.
-    pub async fn read_active_tab(&self) -> Result<Option<String>> {
-        let session = {
+    async fn ensure_session_id(&self) -> Option<String> {
+        let existing = {
             let lock = self.session_id.lock().await;
             lock.clone()
         };
+        match existing {
+            Some(s) => Some(s),
+            None => self.init_session().await.ok(),
+        }
+    }
 
-        let session_id = match session {
-            Some(s) => s,
-            None => match self.init_session().await {
-                Ok(s) => s,
-                Err(_) => return Ok(None),
-            },
+    /// Evaluates `document.title` and `location.href` in the managed tab, wrapping in nonced untrusted tags.
+    pub async fn read_active_tab(&self) -> Result<Option<String>> {
+        let Some(session_id) = self.ensure_session_id().await else {
+            return Ok(None);
         };
 
         let eval_res = self
@@ -847,6 +906,25 @@ impl ManagedCdpBrowser {
             }
             Err(e) => {
                 warn!("Failed to read active tab via CDP: {}", e);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Fetches the Accessibility tree (`Accessibility.getFullAXTree`) for the active tab, returning UTF-8 capped compact nodes.
+    pub async fn read_active_tab_ax_tree(&self) -> Result<Option<String>> {
+        let Some(session_id) = self.ensure_session_id().await else {
+            return Ok(None);
+        };
+
+        let ax_res = self
+            .send_command("Accessibility.getFullAXTree", json!({}), Some(&session_id))
+            .await;
+
+        match ax_res {
+            Ok(res) => Ok(Some(format_ax_tree_nodes(&res))),
+            Err(e) => {
+                warn!("Failed to read active tab AXTree via CDP: {}", e);
                 Ok(None)
             }
         }
@@ -902,42 +980,36 @@ pub async fn shutdown_managed_browser() {
     }
 }
 
-/// Opens a destination URL via managed Chromium anonymous pipe transport,
-/// falling back to Windows Shell if no browser binary is installed.
+/// Opens a destination URL via managed Chromium anonymous pipe transport.
+/// Fails closed if no trusted Chromium binary is installed or if CDP navigation fails.
 pub async fn open_url(url: &str) -> Result<()> {
+    open_url_with_binary(url, find_trusted_chromium_binary()).await
+}
+
+async fn open_url_with_binary(url: &str, binary: Option<PathBuf>) -> Result<()> {
     CdpSecurityGate::validate_navigation_url(url)?;
 
     let mut lock = get_browser_lock().await.lock().await;
     if lock.is_none() {
-        if let Some(bin) = find_trusted_chromium_binary() {
-            match ManagedCdpBrowser::spawn(&bin) {
-                Ok(browser) => {
-                    *lock = Some(browser);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to spawn managed Chromium CDP browser: {e}; falling back to Windows Shell"
-                    );
-                }
-            }
-        }
+        let bin = binary.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Isolated CDP browser unavailable: no trusted Chromium/Edge/Brave binary found (shell fallback disabled)"
+            )
+        })?;
+        let browser = ManagedCdpBrowser::spawn(&bin)
+            .context("Failed to spawn isolated Chromium CDP browser (shell fallback disabled)")?;
+        *lock = Some(browser);
     }
 
     if let Some(ref browser) = *lock {
-        match browser.navigate(url).await {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                warn!("CDP navigation failed: {e}; falling back to Windows Shell");
-            }
+        if let Err(e) = browser.navigate(url).await {
+            *lock = None;
+            return Err(e).context("Isolated CDP navigation failed (shell fallback disabled)");
         }
+        return Ok(());
     }
 
-    info!("Opening URL via Windows Shell: {}", url);
-    std::process::Command::new("explorer.exe")
-        .arg(url)
-        .spawn()?;
-
-    Ok(())
+    anyhow::bail!("Isolated CDP browser state unavailable")
 }
 
 /// Opens YouTube search results or homepage via managed Chromium anonymous pipe transport.
@@ -946,8 +1018,63 @@ pub async fn open_youtube(query: Option<&str>) -> Result<()> {
     open_url(&url).await
 }
 
-/// Reads the active tab in the managed Chromium session.
-pub async fn read_active_tab() -> Result<Option<String>> {
+/// Formats a CDP `Accessibility.getFullAXTree` JSON response into compact visible node lines capped at 16 KiB.
+pub fn format_ax_tree_nodes(ax_response: &Value) -> String {
+    let nodes = match ax_response.get("nodes").and_then(|v| v.as_array()) {
+        Some(n) if !n.is_empty() => n,
+        _ => return "(empty accessibility tree)".to_string(),
+    };
+
+    let mut lines = Vec::new();
+    for node in nodes {
+        if node.get("ignored").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let role = node
+            .pointer("/role/value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if role.is_empty() || matches!(role, "none" | "generic" | "InlineTextBox") {
+            continue;
+        }
+
+        let name = node
+            .pointer("/name/value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let value = node
+            .pointer("/value/value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+
+        if name.is_empty() && value.is_empty() {
+            continue;
+        }
+
+        let line = match (name.is_empty(), value.is_empty() || value == name) {
+            (false, true) => format!("[{}] {}", role, name),
+            (true, false) => format!("[{}] = {:?}", role, value),
+            (false, false) => format!("[{}] {} = {:?}", role, name, value),
+            (true, true) => continue,
+        };
+        lines.push(line);
+        if lines.len() >= 250 {
+            break;
+        }
+    }
+
+    if lines.is_empty() {
+        return "(empty accessibility tree)".to_string();
+    }
+
+    truncate_utf8_16kib(&lines.join("\n"))
+}
+
+/// Ensures the singleton managed Chromium browser is spawned if installed, returning the lock guard.
+async fn ensure_managed_browser() -> tokio::sync::MutexGuard<'static, Option<ManagedCdpBrowser>> {
     let mut lock = get_browser_lock().await.lock().await;
     if lock.is_none() {
         if let Some(bin) = find_trusted_chromium_binary() {
@@ -956,9 +1083,24 @@ pub async fn read_active_tab() -> Result<Option<String>> {
             }
         }
     }
+    lock
+}
 
+/// Reads the active tab in the managed Chromium session.
+pub async fn read_active_tab() -> Result<Option<String>> {
+    let lock = ensure_managed_browser().await;
     if let Some(ref browser) = *lock {
         browser.read_active_tab().await
+    } else {
+        Ok(None)
+    }
+}
+
+/// Reads the active tab's CDP Accessibility tree (`Accessibility.getFullAXTree`), capped at 16 KiB.
+pub async fn read_active_tab_ax_tree() -> Result<Option<String>> {
+    let lock = ensure_managed_browser().await;
+    if let Some(ref browser) = *lock {
+        browser.read_active_tab_ax_tree().await
     } else {
         Ok(None)
     }
@@ -1048,6 +1190,45 @@ mod tests {
     }
 
     #[test]
+    fn test_cdp_security_gate_ssrf_and_userinfo_bypasses() {
+        // Userinfo bypass attempts
+        assert!(CdpSecurityGate::validate_navigation_url("http://user@127.0.0.1:8080").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("https://evil.com@localhost/").is_err());
+
+        // RFC1918, CGNAT, link-local, loopback CIDR
+        assert!(CdpSecurityGate::validate_navigation_url("http://10.0.0.1/admin").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("http://172.16.0.1/").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("http://172.31.255.254/").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("http://172.32.0.1/").is_ok());
+        assert!(CdpSecurityGate::validate_navigation_url("http://192.168.1.1/").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("http://100.64.0.1/").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("http://169.254.1.1/").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("http://127.0.0.2/").is_err());
+
+        // Hex, integer, octal IP encodings & trailing-dot/subdomain localhost
+        assert!(CdpSecurityGate::validate_navigation_url("http://0x7f000001/").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("http://2130706433/").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("http://0177.0.0.1/").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("http://localhost./").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("http://sub.localhost/").is_err());
+
+        // IPv6 unspecified, IPv4-mapped loopback, link-local, ULA
+        assert!(CdpSecurityGate::validate_navigation_url("http://[::]/").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("http://[::ffff:127.0.0.1]/").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("http://[fe80::1]/").is_err());
+        assert!(CdpSecurityGate::validate_navigation_url("http://[fd00::1]/").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_open_url_fails_closed_without_shell_fallback() {
+        let res = open_url_with_binary("https://example.com", None).await;
+        assert!(
+            res.is_err(),
+            "open_url must fail closed when no isolated Chromium binary is available"
+        );
+    }
+
+    #[test]
     fn test_nul_delimited_framing_roundtrip_and_fragmentation() {
         let mut framer = CdpNulFramer::new();
 
@@ -1121,5 +1302,29 @@ mod tests {
         // Clean shutdown
         browser.close_browser();
         assert!(!profile_dir.is_dir(), "Ephemeral profile dir must be deleted on close");
+    }
+
+    #[test]
+    fn test_format_ax_tree_nodes_compacts_and_filters() {
+        let sample = json!({
+            "nodes": [
+                { "ignored": true, "role": { "value": "heading" }, "name": { "value": "Hidden" } },
+                { "ignored": false, "role": { "value": "InlineTextBox" }, "name": { "value": "Noise" } },
+                { "ignored": false, "role": { "value": "generic" }, "name": { "value": "Wrapper" } },
+                { "ignored": false, "role": { "value": "heading" }, "name": { "value": "Dashboard" } },
+                { "ignored": false, "role": { "value": "textbox" }, "name": { "value": "Search" }, "value": { "value": "rust async" } },
+                { "ignored": false, "role": { "value": "button" }, "name": { "value": "Submit" } }
+            ]
+        });
+
+        let formatted = format_ax_tree_nodes(&sample);
+        assert!(!formatted.contains("Hidden"));
+        assert!(!formatted.contains("InlineTextBox"));
+        assert!(!formatted.contains("Wrapper"));
+        assert!(formatted.contains("[heading] Dashboard"));
+        assert!(formatted.contains("[textbox] Search = \"rust async\""));
+        assert!(formatted.contains("[button] Submit"));
+
+        assert_eq!(format_ax_tree_nodes(&json!({})), "(empty accessibility tree)");
     }
 }

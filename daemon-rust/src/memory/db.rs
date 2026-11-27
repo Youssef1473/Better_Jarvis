@@ -151,6 +151,12 @@ enum DbCommand {
         limit: usize,
         reply: oneshot::Sender<Result<Vec<HybridSearchResult>>>,
     },
+    SearchFactsSemantic {
+        query: String,
+        query_embedding: Option<Vec<f32>>,
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<(FactRecord, f32)>>>,
+    },
     Shutdown {
         reply: oneshot::Sender<Result<()>>,
     },
@@ -238,6 +244,10 @@ impl MemoryDb {
                             let res = Self::sync_hybrid_search(&conn, &query, query_embedding.as_deref(), limit);
                             let _ = reply.send(res);
                         }
+                        DbCommand::SearchFactsSemantic { query, query_embedding, limit, reply } => {
+                            let res = Self::sync_search_facts_semantic(&conn, &query, query_embedding.as_deref(), limit);
+                            let _ = reply.send(res);
+                        }
                         DbCommand::Shutdown { reply } => {
                             let res = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                                 .context("WAL checkpoint truncate failed on shutdown");
@@ -316,6 +326,10 @@ impl MemoryDb {
                         }
                         DbCommand::HybridSearch { query, query_embedding, limit, reply } => {
                             let res = Self::sync_hybrid_search(&conn, &query, query_embedding.as_deref(), limit);
+                            let _ = reply.send(res);
+                        }
+                        DbCommand::SearchFactsSemantic { query, query_embedding, limit, reply } => {
+                            let res = Self::sync_search_facts_semantic(&conn, &query, query_embedding.as_deref(), limit);
                             let _ = reply.send(res);
                         }
                         DbCommand::Shutdown { reply } => {
@@ -412,14 +426,17 @@ impl MemoryDb {
             |r| r.get(0),
         )?;
 
-        if let Some(emb) = embedding {
-            if emb.len() == 384 {
-                let blob = encode_embedding(emb);
-                conn.execute(
-                    "INSERT OR REPLACE INTO facts_vec (fact_id, embedding) VALUES (?1, ?2)",
-                    params![fact_id, blob],
-                )?;
-            }
+        if let Some(emb) = embedding.filter(|e| e.len() == 384) {
+            let blob = encode_embedding(emb);
+            conn.execute(
+                "INSERT OR REPLACE INTO facts_vec (fact_id, embedding) VALUES (?1, ?2)",
+                params![fact_id, blob],
+            )?;
+        } else {
+            conn.execute(
+                "DELETE FROM facts_vec WHERE fact_id = ?1",
+                params![fact_id],
+            )?;
         }
 
         Ok(())
@@ -468,6 +485,88 @@ impl MemoryDb {
 
         let affected = conn.execute("DELETE FROM facts WHERE key = ?1", params![key.trim()])?;
         Ok(affected > 0)
+    }
+
+    fn sync_search_facts_semantic(
+        conn: &Connection,
+        query: &str,
+        query_embedding: Option<&[f32]>,
+        limit: usize,
+    ) -> Result<Vec<(FactRecord, f32)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut scored: HashMap<i64, (FactRecord, f32)> = HashMap::new();
+
+        if let Some(emb) = query_embedding {
+            if emb.len() == 384 {
+                let blob = encode_embedding(emb);
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT f.id, f.key, f.value, f.tier, f.source_trusted, f.updated_at, fv.distance
+                     FROM facts_vec fv
+                     JOIN facts f ON f.id = fv.fact_id
+                     WHERE fv.embedding MATCH ?1 AND k = ?2
+                     ORDER BY fv.distance ASC",
+                ) {
+                    if let Ok(rows) = stmt.query_map(params![blob, (limit * 2).max(10) as i64], |r| {
+                        let trusted_int: i64 = r.get(4)?;
+                        let dist: f32 = r.get(6)?;
+                        Ok((
+                            FactRecord {
+                                id: r.get(0)?,
+                                key: r.get(1)?,
+                                value: r.get(2)?,
+                                tier: r.get(3)?,
+                                source_trusted: trusted_int != 0,
+                                updated_at: r.get(5)?,
+                            },
+                            (1.0 - dist).max(0.0),
+                        ))
+                    }) {
+                        for (fact, sim) in rows.flatten() {
+                            scored.insert(fact.id, (fact, sim));
+                        }
+                    }
+                }
+            }
+        }
+
+        let trimmed = query.trim();
+        if !trimmed.is_empty() {
+            let pattern = format!("%{}%", trimmed);
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT id, key, value, tier, source_trusted, updated_at
+                 FROM facts
+                 WHERE key LIKE ?1 OR value LIKE ?1
+                 ORDER BY updated_at DESC
+                 LIMIT ?2",
+            ) {
+                if let Ok(rows) = stmt.query_map(params![pattern, limit as i64], |r| {
+                    let trusted_int: i64 = r.get(4)?;
+                    Ok(FactRecord {
+                        id: r.get(0)?,
+                        key: r.get(1)?,
+                        value: r.get(2)?,
+                        tier: r.get(3)?,
+                        source_trusted: trusted_int != 0,
+                        updated_at: r.get(5)?,
+                    })
+                }) {
+                    for fact in rows.flatten() {
+                        scored
+                            .entry(fact.id)
+                            .and_modify(|(_, s)| *s += 0.25)
+                            .or_insert((fact, 0.25));
+                    }
+                }
+            }
+        }
+
+        let mut results: Vec<(FactRecord, f32)> = scored.into_values().collect();
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+        Ok(results)
     }
 
     fn sync_insert_note_chunk(
@@ -830,6 +929,26 @@ impl MemoryDb {
         rx.await.map_err(|_| anyhow::anyhow!("DB actor dropped response"))?
     }
 
+    /// Queries stored facts via `facts_vec` cosine similarity (plus SQL substring boost/fallback).
+    pub async fn search_facts_semantic(
+        &self,
+        query: &str,
+        query_embedding: Option<&[f32]>,
+        limit: usize,
+    ) -> Result<Vec<(FactRecord, f32)>> {
+        let (reply, rx) = oneshot::channel();
+        self.sender
+            .send(DbCommand::SearchFactsSemantic {
+                query: query.to_string(),
+                query_embedding: query_embedding.map(|e| e.to_vec()),
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("DB actor disconnected"))?;
+        rx.await.map_err(|_| anyhow::anyhow!("DB actor dropped response"))?
+    }
+
     /// Flushes WAL log via PRAGMA wal_checkpoint(TRUNCATE) and terminates the actor thread.
     pub async fn shutdown(&self) -> Result<()> {
         let (reply, rx) = oneshot::channel();
@@ -971,6 +1090,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_facts_vec_semantic_search_ranks_by_embedding() {
+        let db = MemoryDb::in_memory().unwrap();
+
+        let mut v_editor = vec![0.0f32; 384];
+        v_editor[0] = 1.0;
+
+        let mut v_music = vec![0.0f32; 384];
+        v_music[1] = 1.0;
+
+        db.upsert_fact_with_opts("preferred_ide", "Neovim with LSP", "preference", true, Some(&v_editor))
+            .await
+            .unwrap();
+        db.upsert_fact_with_opts("favorite_genre", "Ambient electronic", "profile", true, Some(&v_music))
+            .await
+            .unwrap();
+
+        let hits = db
+            .search_facts_semantic("coding workspace", Some(&v_editor), 2)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0.key, "preferred_ide");
+        assert!(hits[0].1 > hits[1].1);
+
+        let kw_hits = db.search_facts_semantic("Ambient", None, 2).await.unwrap();
+        assert_eq!(kw_hits.len(), 1);
+        assert_eq!(kw_hits[0].0.key, "favorite_genre");
+
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_notes_semantic_and_keyword_search() {
         let db = MemoryDb::in_memory().unwrap();
 
@@ -1039,5 +1190,38 @@ mod tests {
         assert_eq!(count, 50);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_fact_without_embedding_clears_stale_vector() {
+        let db = MemoryDb::in_memory().unwrap();
+        let mut v_old = vec![0.0f32; 384];
+        v_old[0] = 1.0;
+
+        db.upsert_fact_with_opts("drink", "espresso", "preference", true, Some(&v_old))
+            .await
+            .unwrap();
+        let initial_hits = db
+            .search_facts_semantic("", Some(&v_old), 5)
+            .await
+            .unwrap();
+        assert_eq!(initial_hits.len(), 1);
+        assert_eq!(initial_hits[0].0.value, "espresso");
+
+        // Overwrite without embedding: stale vector row in facts_vec must be removed
+        db.upsert_fact_with_opts("drink", "matcha", "preference", true, None)
+            .await
+            .unwrap();
+        let stale_hits = db
+            .search_facts_semantic("", Some(&v_old), 5)
+            .await
+            .unwrap();
+        assert!(
+            stale_hits.is_empty(),
+            "Overwriting fact without embedding must clear stale facts_vec row, got {:?}",
+            stale_hits
+        );
+
+        db.shutdown().await.unwrap();
     }
 }

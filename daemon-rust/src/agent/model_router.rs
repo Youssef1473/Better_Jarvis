@@ -3,6 +3,7 @@ pub enum ModelTier {
     Fast,
     Heavy,
     Fallback,
+    LocalFallback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -171,4 +171,24 @@ add_executable(test_hud_watchdog
 target_include_directories(test_hud_watchdog PRIVATE include)
 target_compile_definitions(test_hud_watchdog PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
+add_executable(test_operational_throughput
+    tests/test_operational_throughput.cpp
+)
+target_include_directories(test_operational_throughput PRIVATE include)
+target_compile_definitions(test_operational_throughput PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+
+enable_testing()
+add_test(NAME test_frame_codec COMMAND test_frame_codec)
+add_test(NAME test_ring_buffer COMMAND test_ring_buffer)
+add_test(NAME test_resampler COMMAND test_resampler)
+add_test(NAME test_aec COMMAND test_aec)
+add_test(NAME test_hotkey_listener COMMAND test_hotkey_listener)
+add_test(NAME test_latency_tracker COMMAND test_latency_tracker)
+add_test(NAME test_vad COMMAND test_vad)
+add_test(NAME test_piper_tts COMMAND test_piper_tts)
+add_test(NAME test_whisper_stt COMMAND test_whisper_stt)
+add_test(NAME test_crash_handler COMMAND test_crash_handler)
+add_test(NAME test_hud_watchdog COMMAND test_hud_watchdog)
+add_test(NAME test_operational_throughput COMMAND test_operational_throughput)
+
 

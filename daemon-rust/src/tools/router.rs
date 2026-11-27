@@ -484,4 +484,25 @@ mod tests {
             }
         );
     }
+
+    #[tokio::test]
+    async fn test_execute_intent_open_discord_dispatches_to_os_controller() {
+        let intent = parse_intent("open discord");
+        let policy = PolicyEngine::new(&[]);
+        let conf_mgr = ConfirmationManager::new();
+        let mock_os = crate::tools::os_control::MockOsController::default();
+
+        let res = execute_intent(&intent, &policy, &conf_mgr, None, &mock_os)
+            .await
+            .expect("open discord execution should succeed");
+
+        match res {
+            RouteExecutionResult::Executed { intent, output, .. } => {
+                assert_eq!(intent, "LaunchApp");
+                assert_eq!(output, "Launched Discord");
+            }
+            other => panic!("Expected Executed result, got {:?}", other),
+        }
+        assert_eq!(*mock_os.last_target.lock().unwrap(), Some("discord:".into()));
+    }
 }

@@ -222,7 +222,9 @@ $cppTests = @(
     @{ Name = "test_vad"; Src = "host-cpp/tests/test_vad.cpp"; ExtraSrc = "host-cpp/src/audio/silero_vad.cpp"; Libs = "C:/msys64/ucrt64/bin/onnxruntime.dll" },
     @{ Name = "test_piper_tts"; Src = "host-cpp/tests/test_piper_tts.cpp"; ExtraSrc = "host-cpp/src/audio/piper_tts.cpp"; Libs = "C:/msys64/ucrt64/bin/onnxruntime.dll -L C:/msys64/ucrt64/lib -lespeak-ng -lole32 -lavrt -luser32" },
     @{ Name = "test_whisper_stt"; Src = "host-cpp/tests/test_whisper_stt.cpp"; ExtraSrc = "host-cpp/src/audio/whisper_stt.cpp"; Libs = "-L C:/msys64/ucrt64/lib -lwhisper -lggml" },
-    @{ Name = "test_crash_handler"; Src = "host-cpp/tests/test_crash_handler.cpp"; ExtraSrc = "host-cpp/src/diagnostics/crash_handler.cpp"; Libs = "" }
+    @{ Name = "test_crash_handler"; Src = "host-cpp/tests/test_crash_handler.cpp"; ExtraSrc = "host-cpp/src/diagnostics/crash_handler.cpp"; Libs = "" },
+    @{ Name = "test_hud_watchdog"; Src = "host-cpp/tests/test_hud_watchdog.cpp"; ExtraSrc = ""; Libs = "" },
+    @{ Name = "test_operational_throughput"; Src = "host-cpp/tests/test_operational_throughput.cpp"; ExtraSrc = ""; Libs = "" }
 )
 
 foreach ($t in $cppTests) {

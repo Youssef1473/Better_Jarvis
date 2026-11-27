@@ -58,8 +58,7 @@ std::unique_ptr<jarvis::input::HotkeyListener> g_hotkey;
 std::atomic<bool>     g_running{true};
 std::atomic<bool>     g_daemon_ready{false};
 std::atomic<bool>     g_is_paused{false};
-std::atomic<HudState> g_hud_state{HudState::Connecting};
-std::wstring          g_hud_label = L"JARVIS // CONNECTING...";
+jarvis::ui::HudRuntimeState g_hud;
 float                 g_anim_phase = 0.0f;
 
 // Amber Confirmation State
@@ -77,7 +76,6 @@ std::wstring          g_vision_app;
 std::atomic<bool>     g_ptt_active{false};
 std::mutex            g_ptt_mutex;
 std::vector<float>    g_ptt_audio_buffer;
-std::chrono::steady_clock::time_point g_listening_start_time = std::chrono::steady_clock::now();
 
 // Audio Subsystems
 jarvis::audio::SpscRingBuffer<32768>           g_raw_mic_buffer;
@@ -91,6 +89,59 @@ std::unique_ptr<jarvis::audio::WasapiCapture>  g_capture;
 std::unique_ptr<jarvis::audio::SileroVad>      g_vad;
 std::unique_ptr<jarvis::audio::WhisperStt>     g_stt;
 std::unique_ptr<jarvis::audio::PiperTts>       g_tts;
+
+struct PendingTtsItem {
+    uint32_t turn_id{0};
+    std::string text;
+};
+
+std::mutex g_tts_queue_mutex;
+std::condition_variable g_tts_queue_cv;
+std::deque<PendingTtsItem> g_tts_queue;
+
+void EnqueueTtsSpeech(uint32_t turn_id, std::string text) {
+    if (text.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(g_tts_queue_mutex);
+        if (g_tts_queue.size() >= 64) {
+            g_tts_queue.pop_front();
+        }
+        g_tts_queue.push_back(PendingTtsItem{turn_id, std::move(text)});
+    }
+    g_tts_queue_cv.notify_one();
+}
+
+void ClearTtsQueue() {
+    std::lock_guard<std::mutex> lock(g_tts_queue_mutex);
+    g_tts_queue.clear();
+}
+
+void TtsSynthWorkerLoop() {
+    while (g_running.load(std::memory_order_acquire)) {
+        PendingTtsItem item;
+        {
+            std::unique_lock<std::mutex> lock(g_tts_queue_mutex);
+            g_tts_queue_cv.wait_for(lock, std::chrono::milliseconds(100), []() {
+                return !g_running.load(std::memory_order_acquire) || !g_tts_queue.empty();
+            });
+            if (!g_running.load(std::memory_order_acquire)) break;
+            if (g_tts_queue.empty()) continue;
+            item = std::move(g_tts_queue.front());
+            g_tts_queue.pop_front();
+        }
+
+        if (!g_tts || g_is_paused.load(std::memory_order_acquire)) {
+            continue;
+        }
+        const uint32_t active = g_active_turn_id.load(std::memory_order_acquire);
+        const uint32_t cancelled = g_cancelled_turn_id.load(std::memory_order_acquire);
+        if (item.turn_id != 0 &&
+            (item.turn_id != active || item.turn_id == cancelled || g_latency_tracker.IsTurnCancelled(item.turn_id))) {
+            continue;
+        }
+        g_tts->Speak(item.text);
+    }
+}
 
 std::mutex g_ipc_out_mutex;
 std::condition_variable g_ipc_out_cv;
@@ -206,8 +257,9 @@ void ResolveConfirmation(bool approved) {
     const int pos_x = (screen_w - pill_w) / 2;
     SetWindowPos(g_hwnd, HWND_TOPMOST, pos_x, 18, pill_w, pill_h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
-    g_hud_state.store(approved ? HudState::Thinking : HudState::Ready);
-    g_hud_label = approved ? L"JARVIS // EXECUTING..." : L"JARVIS // CANCELLED";
+    g_hud.Transition(
+        approved ? HudState::Thinking : HudState::Ready,
+        approved ? L"JARVIS // EXECUTING..." : L"JARVIS // CANCELLED");
     InvalidateRect(g_hwnd, nullptr, TRUE);
 }
 
@@ -314,7 +366,7 @@ void IpcWorkerLoop() {
                         if (status == "READY") {
                             g_daemon_ready.store(true);
                             if (!g_is_paused.load()) {
-                                g_hud_state.store(HudState::Ready);
+                                g_hud.Transition(HudState::Ready, L"JARVIS // READY");
                             }
                             if (g_hwnd) {
                                 PostMessageW(g_hwnd, WM_APP_IPC_READY, 0, 0);
@@ -339,21 +391,29 @@ void IpcWorkerLoop() {
                                 if (g_tts && !text.empty() && !g_is_paused.load()) {
                                     if (seq == 0) {
                                         g_latency_tracker.RecordTtsFirstAudio(turn_id);
-                                        g_hud_state.store(HudState::Speaking);
-                                        g_hud_label = L"JARVIS // SPEAKING...";
+                                        g_hud.Transition(HudState::Speaking, L"JARVIS // SPEAKING...");
                                         if (g_hwnd) {
                                             PostMessageW(g_hwnd, WM_APP_SPEECH, 0, 0);
                                         }
                                     }
-                                    g_tts->Speak(text);
+                                    EnqueueTtsSpeech(turn_id, text);
                                 }
 
                                 // When stream is final, if nothing is speaking, cleanly return HUD to Ready
-                                if (is_final && g_tts && !g_tts->IsSpeaking() && g_hud_state.load() == HudState::Thinking) {
-                                    g_hud_state.store(g_is_paused.load() ? HudState::Paused : HudState::Ready);
-                                    g_hud_label = g_is_paused.load() ? L"JARVIS // PAUSED" : L"JARVIS // READY";
-                                    if (g_hwnd) {
-                                        PostMessageW(g_hwnd, WM_APP_SPEECH, 0, 0);
+                                if (is_final && g_tts && !g_tts->IsSpeaking() && g_hud.State() == HudState::Thinking) {
+                                    bool pending_tts = false;
+                                    {
+                                        std::lock_guard<std::mutex> lock(g_tts_queue_mutex);
+                                        pending_tts = !g_tts_queue.empty();
+                                    }
+                                    if (!pending_tts) {
+                                        const bool paused = g_is_paused.load();
+                                        g_hud.Transition(
+                                            paused ? HudState::Paused : HudState::Ready,
+                                            paused ? L"JARVIS // PAUSED" : L"JARVIS // READY");
+                                        if (g_hwnd) {
+                                            PostMessageW(g_hwnd, WM_APP_SPEECH, 0, 0);
+                                        }
                                     }
                                 }
                             }
@@ -366,21 +426,23 @@ void IpcWorkerLoop() {
                                 g_latency_tracker.RecordTtsFirstAudio(turn_id);
                                 const std::string text = resp["params"].value("text", "");
                                 if (g_tts && !text.empty() && !g_is_paused.load()) {
-                                    g_hud_state.store(HudState::Speaking);
-                                    g_hud_label = L"JARVIS // SPEAKING...";
+                                    g_hud.Transition(HudState::Speaking, L"JARVIS // SPEAKING...");
                                     if (g_hwnd) {
                                         PostMessageW(g_hwnd, WM_APP_SPEECH, 0, 0);
                                     }
-                                    g_tts->Speak(text);
+                                    EnqueueTtsSpeech(turn_id, text);
                                 }
                             }
                         } else if (method == "tts.stop") {
+                            ClearTtsQueue();
                             if (g_tts) {
                                 g_tts->BargeIn();
                             }
-                            if (g_hud_state.load() == HudState::Speaking) {
-                                g_hud_state.store(g_is_paused.load() ? HudState::Paused : HudState::Ready);
-                                g_hud_label = g_is_paused.load() ? L"JARVIS // PAUSED" : L"JARVIS // READY";
+                            if (g_hud.State() == HudState::Speaking) {
+                                const bool paused = g_is_paused.load();
+                                g_hud.Transition(
+                                    paused ? HudState::Paused : HudState::Ready,
+                                    paused ? L"JARVIS // PAUSED" : L"JARVIS // READY");
                                 if (g_hwnd) {
                                     PostMessageW(g_hwnd, WM_APP_SPEECH, 0, 0);
                                 }
@@ -393,10 +455,10 @@ void IpcWorkerLoop() {
                             g_confirm_id.store(id);
                             {
                                 std::lock_guard<std::mutex> lock(g_confirm_mutex);
-                                g_confirm_command = std::wstring(cmd.begin(), cmd.end());
+                                g_confirm_command = jarvis::ui::Utf8ToWide(cmd);
                             }
                             g_confirm_timeout_ms.store(timeout_ms);
-                            g_hud_state.store(HudState::Confirmation);
+                            g_hud.Transition(HudState::Confirmation, L"JARVIS // CONFIRM");
 
                             if (g_hwnd) {
                                 PostMessageW(g_hwnd, WM_APP_CONFIRMATION, 0, 0);
@@ -407,7 +469,7 @@ void IpcWorkerLoop() {
                             g_vision_active.store(active);
                             {
                                 std::lock_guard<std::mutex> lock(g_vision_mutex);
-                                g_vision_app = std::wstring(app.begin(), app.end());
+                                g_vision_app = jarvis::ui::Utf8ToWide(app);
                             }
                             if (g_hwnd) {
                                 InvalidateRect(g_hwnd, nullptr, TRUE);
@@ -429,7 +491,7 @@ void IpcWorkerLoop() {
         CloseHandle(pipe);
 
         g_daemon_ready.store(false);
-        g_hud_state.store(HudState::Connecting);
+        g_hud.Transition(HudState::Connecting, L"JARVIS // CONNECTING...");
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
@@ -522,8 +584,8 @@ void VadWorkerLoop() {
 
             bool processed = g_vad->ProcessNextFrame();
 
-            // When paused, bypass audio handoff
-            if (g_is_paused.load(std::memory_order_relaxed)) {
+            // When paused or PTT recording is active, bypass VAD state transitions
+            if (g_is_paused.load(std::memory_order_relaxed) || g_ptt_active.load(std::memory_order_acquire)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(15));
                 continue;
             }
@@ -532,6 +594,7 @@ void VadWorkerLoop() {
                 if (is_speaking) {
                     // Barge-In Action Sequence:
                     // 1. Instant sub-20ms audio cutoff
+                    ClearTtsQueue();
                     g_tts->StopPlayback();
 
                     // Consumer-side drain of residual far-end reference samples
@@ -552,15 +615,12 @@ void VadWorkerLoop() {
                     SendIpcJson(barge_in_msg);
 
                     // 3. Immediate HUD state transition to Listening
-                    g_hud_state.store(HudState::Listening);
-                    g_hud_label = L"JARVIS // LISTENING (BARGE-IN)...";
+                    g_hud.Transition(HudState::Listening, L"JARVIS // LISTENING (BARGE-IN)...");
                     if (g_hwnd) {
                         PostMessageW(g_hwnd, WM_APP_SPEECH, 0, 0);
                     }
-                } else if (g_hud_state.load() != HudState::Listening && g_hud_state.load() != HudState::Confirmation) {
-                    g_listening_start_time = std::chrono::steady_clock::now();
-                    g_hud_state.store(HudState::Listening);
-                    g_hud_label = L"JARVIS // LISTENING...";
+                } else if (g_hud.State() != HudState::Listening && g_hud.State() != HudState::Confirmation) {
+                    g_hud.Transition(HudState::Listening, L"JARVIS // LISTENING...");
                     if (g_hwnd) {
                         PostMessageW(g_hwnd, WM_APP_SPEECH, 0, 0);
                     }
@@ -658,6 +718,7 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
 
             // Immediate barge-in on voice playback
+            ClearTtsQueue();
             if (g_tts && g_tts->IsSpeaking()) {
                 g_tts->StopPlayback();
                 const uint32_t turn_id = g_active_turn_id.load(std::memory_order_relaxed);
@@ -681,7 +742,7 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // True PTT Start:
             // 1. Mark PTT active and record start time for watchdog
             g_ptt_active.store(true, std::memory_order_release);
-            g_listening_start_time = std::chrono::steady_clock::now();
+            g_hud.ResetListeningStart();
 
             // 2. Snapshot 300 ms pre-roll (4,800 samples @ 16 kHz) from clean ring buffer
             constexpr size_t kPttPreRollSamples = 4800;
@@ -695,8 +756,7 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
 
             // 3. Instant silent HUD flip (NO "Yes, sir?" playback to avoid tripping barge-in gates)
-            g_hud_state.store(HudState::Listening);
-            g_hud_label = L"JARVIS // LISTENING...";
+            g_hud.Transition(HudState::Listening, L"JARVIS // LISTENING...");
             InvalidateRect(hwnd, nullptr, TRUE);
 
             return 0;
@@ -705,9 +765,6 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (!g_ptt_active.exchange(false, std::memory_order_acq_rel)) {
                 return 0;
             }
-
-            const uint32_t turn_id = g_active_turn_id.load(std::memory_order_relaxed);
-            g_latency_tracker.RecordPttUp(turn_id);
 
             std::vector<float> ptt_audio;
             {
@@ -726,15 +783,15 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             // Threshold: >= 250 ms (4000 samples @ 16 kHz) and non-silent (RMS >= 0.0001f)
             if (duration_ms >= 250.0f && rms >= 0.0001f) {
-                g_hud_state.store(HudState::Thinking);
-                g_hud_label = L"JARVIS // THINKING...";
-                InvalidateRect(hwnd, nullptr, TRUE);
-
                 static std::atomic<uint32_t> s_ptt_turn_id{1};
                 uint32_t ptt_turn = s_ptt_turn_id.fetch_add(1);
                 if (ptt_turn == 0) ptt_turn = s_ptt_turn_id.fetch_add(1);
                 g_active_turn_id.store(ptt_turn, std::memory_order_release);
+                g_latency_tracker.RecordPttUp(ptt_turn);
                 g_latency_tracker.RecordVadEnd(ptt_turn);
+
+                g_hud.Transition(HudState::Thinking, L"JARVIS // THINKING...");
+                InvalidateRect(hwnd, nullptr, TRUE);
 
                 if (g_stt && g_stt->IsModelLoaded()) {
                     g_stt->EnqueueUtterance(std::move(ptt_audio));
@@ -767,8 +824,7 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else {
                 // Short or silent release: return cleanly to Ready immediately
                 if (!g_is_paused.load()) {
-                    g_hud_state.store(HudState::Ready);
-                    g_hud_label = L"JARVIS // READY";
+                    g_hud.Transition(HudState::Ready, L"JARVIS // READY");
                     InvalidateRect(hwnd, nullptr, TRUE);
                 }
             }
@@ -776,8 +832,7 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_APP_IPC_READY: {
             if (!g_is_paused.load()) {
-                g_hud_state.store(HudState::Ready);
-                g_hud_label = L"JARVIS // READY";
+                g_hud.Transition(HudState::Ready, L"JARVIS // READY");
             }
             InvalidateRect(hwnd, nullptr, TRUE);
             return 0;
@@ -802,7 +857,7 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         case WM_KEYDOWN: {
-            if (g_hud_state.load() == HudState::Confirmation) {
+            if (g_hud.State() == HudState::Confirmation) {
                 if (wParam == VK_RETURN) {
                     ResolveConfirmation(true);
                     return 0;
@@ -812,11 +867,11 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
             } else if (wParam == VK_ESCAPE) {
                 // Global escape key stops any active speaking/processing
+                ClearTtsQueue();
                 if (g_tts) g_tts->BargeIn();
                 if (g_stt) g_stt->ClearQueue();
                 if (!g_is_paused.load()) {
-                    g_hud_state.store(HudState::Ready);
-                    g_hud_label = L"JARVIS // READY";
+                    g_hud.Transition(HudState::Ready, L"JARVIS // READY");
                     InvalidateRect(hwnd, nullptr, TRUE);
                 }
                 return 0;
@@ -829,7 +884,7 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RECT rc{};
             GetClientRect(hwnd, &rc);
 
-            const HudState state = g_hud_state.load();
+            const HudState state = g_hud.State();
 
             if (state == HudState::Confirmation) {
                 // Confirmation button clicks
@@ -852,6 +907,7 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_is_paused.store(new_paused);
 
                     // Immediate cutoff
+                    ClearTtsQueue();
                     if (g_tts) g_tts->BargeIn();
                     if (g_stt) g_stt->ClearQueue();
                     if (g_vad) g_vad->ResetState();
@@ -864,11 +920,9 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     SendIpcJson(stop_msg);
 
                     if (new_paused) {
-                        g_hud_state.store(HudState::Paused);
-                        g_hud_label = L"JARVIS // PAUSED";
+                        g_hud.Transition(HudState::Paused, L"JARVIS // PAUSED");
                     } else {
-                        g_hud_state.store(HudState::Ready);
-                        g_hud_label = L"JARVIS // READY";
+                        g_hud.Transition(HudState::Ready, L"JARVIS // READY");
                     }
 
                     InvalidateRect(hwnd, nullptr, TRUE);
@@ -877,7 +931,7 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     // Clicked anywhere on HUD pill body: Toggle push-to-talk listening state cleanly
                     if (g_ptt_active.load(std::memory_order_acquire)) {
                         PostMessageW(hwnd, WM_APP_RELEASE_SPEAK, 0, 0);
-                    } else if (g_hud_state.load() == HudState::Ready) {
+                    } else if (g_hud.State() == HudState::Ready) {
                         PostMessageW(hwnd, WM_APP_TRIGGER_SPEAK, 0, 0);
                     }
                     return 0;
@@ -890,48 +944,58 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_anim_phase += 0.15f;
                 if (g_anim_phase > 62.83f) g_anim_phase = 0.0f;
 
+                const HudState cur_state = g_hud.State();
+
                 // Return to Ready when TTS completes
-                if (g_hud_state.load() == HudState::Speaking && g_tts && !g_tts->IsSpeaking()) {
-                    g_hud_state.store(g_is_paused.load() ? HudState::Paused : HudState::Ready);
-                    g_hud_label = g_is_paused.load() ? L"JARVIS // PAUSED" : L"JARVIS // READY";
-                    InvalidateRect(hwnd, nullptr, TRUE);
-                } else if (g_hud_state.load() == HudState::Listening) {
+                if (cur_state == HudState::Speaking && g_tts && !g_tts->IsSpeaking()) {
+                    bool pending_tts = false;
+                    {
+                        std::lock_guard<std::mutex> lock(g_tts_queue_mutex);
+                        pending_tts = !g_tts_queue.empty();
+                    }
+                    if (!pending_tts) {
+                        const bool paused = g_is_paused.load();
+                        g_hud.Transition(
+                            paused ? HudState::Paused : HudState::Ready,
+                            paused ? L"JARVIS // PAUSED" : L"JARVIS // READY");
+                        InvalidateRect(hwnd, nullptr, TRUE);
+                    }
+                } else if (cur_state == HudState::Listening) {
                     // Stuck-Listening Safety Watchdog (15-second ceiling)
                     auto now = std::chrono::steady_clock::now();
-                    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_listening_start_time).count();
+                    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - g_hud.ListeningStartTime()).count();
                     if (elapsed_ms >= 15000) {
                         if (g_ptt_active.load()) {
                             PostMessageW(hwnd, WM_APP_RELEASE_SPEAK, 0, 0);
                         } else {
                             if (g_vad) g_vad->ResetState();
                             if (!g_is_paused.load()) {
-                                g_hud_state.store(HudState::Ready);
-                                g_hud_label = L"JARVIS // READY";
+                                g_hud.Transition(HudState::Ready, L"JARVIS // READY");
                                 InvalidateRect(hwnd, nullptr, TRUE);
                             }
                         }
                     } else {
                         InvalidateRect(hwnd, nullptr, FALSE);
                     }
-                } else if (g_hud_state.load() == HudState::Thinking) {
+                } else if (cur_state == HudState::Thinking) {
                     auto now = std::chrono::steady_clock::now();
                     auto outcome = jarvis::ui::EvaluateThinkingWatchdog(
-                        g_hud_state.load(),
+                        cur_state,
                         g_is_paused.load(),
-                        g_listening_start_time,
+                        g_hud.ThinkingStartTime(),
                         now,
                         std::chrono::milliseconds(20000)
                     );
                     if (outcome.triggered) {
                         if (outcome.state_changed) {
-                            g_hud_state.store(outcome.new_state);
-                            g_hud_label = outcome.new_label;
+                            g_hud.Transition(outcome.new_state, outcome.new_label, now);
                             InvalidateRect(hwnd, nullptr, TRUE);
                         }
                     } else {
                         InvalidateRect(hwnd, nullptr, FALSE);
                     }
-                } else if (g_hud_state.load() == HudState::Speaking) {
+                } else if (cur_state == HudState::Speaking) {
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
             } else if (wParam == ID_TIMER_CONFIRM) {
@@ -960,15 +1024,14 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // Tray Pause/Resume toggle
                 bool new_paused = !g_is_paused.load();
                 g_is_paused.store(new_paused);
+                ClearTtsQueue();
                 if (g_tts) g_tts->BargeIn();
                 if (g_stt) g_stt->ClearQueue();
 
                 if (new_paused) {
-                    g_hud_state.store(HudState::Paused);
-                    g_hud_label = L"JARVIS // PAUSED";
+                    g_hud.Transition(HudState::Paused, L"JARVIS // PAUSED");
                 } else {
-                    g_hud_state.store(HudState::Ready);
-                    g_hud_label = L"JARVIS // READY";
+                    g_hud.Transition(HudState::Ready, L"JARVIS // READY");
                 }
                 InvalidateRect(hwnd, nullptr, TRUE);
             }
@@ -980,15 +1043,26 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RECT rc{};
             GetClientRect(hwnd, &rc);
 
-            const HudState state = g_hud_state.load();
+            const HudState state = g_hud.State();
+            const std::wstring base_label = g_hud.Label();
+            const bool vision_active = g_vision_active.load();
+            std::wstring vision_app;
+            if (vision_active) {
+                std::lock_guard<std::mutex> lock(g_vision_mutex);
+                vision_app = g_vision_app;
+            }
+            const std::wstring hud_label =
+                jarvis::ui::FormatHudLabelWithVision(base_label, vision_active, vision_app);
 
             if (state == HudState::Confirmation) {
                 // Amber Confirmation Card Render
                 HBRUSH bg = CreateSolidBrush(RGB(28, 22, 16));
                 HPEN border = CreatePen(PS_SOLID, 2, RGB(243, 156, 18));
-                SelectObject(hdc, bg);
-                SelectObject(hdc, border);
+                HGDIOBJ old_brush = SelectObject(hdc, bg);
+                HGDIOBJ old_pen = SelectObject(hdc, border);
                 RoundRect(hdc, rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1, 16, 16);
+                SelectObject(hdc, old_pen);
+                SelectObject(hdc, old_brush);
                 DeleteObject(border);
                 DeleteObject(bg);
 
@@ -1013,11 +1087,13 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 RECT allow_rc{rc.left + 24, rc.top + 60, rc.left + 190, rc.top + 88};
                 HBRUSH allow_bg = CreateSolidBrush(RGB(20, 56, 32));
                 HPEN allow_border = CreatePen(PS_SOLID, 1, RGB(46, 204, 113));
-                SelectObject(hdc, allow_bg);
-                SelectObject(hdc, allow_border);
+                HGDIOBJ old_allow_brush = SelectObject(hdc, allow_bg);
+                HGDIOBJ old_allow_pen = SelectObject(hdc, allow_border);
                 RoundRect(hdc, allow_rc.left, allow_rc.top, allow_rc.right, allow_rc.bottom, 10, 10);
                 SetTextColor(hdc, RGB(130, 245, 175));
                 DrawTextW(hdc, L"ENTER: Allow", -1, &allow_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(hdc, old_allow_pen);
+                SelectObject(hdc, old_allow_brush);
                 DeleteObject(allow_border);
                 DeleteObject(allow_bg);
 
@@ -1025,11 +1101,13 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 RECT deny_rc{rc.right - 190, rc.top + 60, rc.right - 24, rc.top + 88};
                 HBRUSH deny_bg = CreateSolidBrush(RGB(56, 20, 24));
                 HPEN deny_border = CreatePen(PS_SOLID, 1, RGB(231, 76, 60));
-                SelectObject(hdc, deny_bg);
-                SelectObject(hdc, deny_border);
+                HGDIOBJ old_deny_brush = SelectObject(hdc, deny_bg);
+                HGDIOBJ old_deny_pen = SelectObject(hdc, deny_border);
                 RoundRect(hdc, deny_rc.left, deny_rc.top, deny_rc.right, deny_rc.bottom, 10, 10);
                 SetTextColor(hdc, RGB(255, 160, 160));
                 DrawTextW(hdc, L"ESC: Deny", -1, &deny_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(hdc, old_deny_pen);
+                SelectObject(hdc, old_deny_brush);
                 DeleteObject(deny_border);
                 DeleteObject(deny_bg);
             } else {
@@ -1070,12 +1148,16 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 HBRUSH bg = CreateSolidBrush(bg_color);
                 HPEN border = CreatePen(PS_SOLID, 2, border_color);
-                SelectObject(hdc, bg);
-                SelectObject(hdc, border);
+                HGDIOBJ old_brush = SelectObject(hdc, bg);
+                HGDIOBJ old_pen = SelectObject(hdc, border);
                 RoundRect(hdc, rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1, 20, 20);
+                SelectObject(hdc, old_pen);
+                SelectObject(hdc, old_brush);
 
                 SetBkMode(hdc, TRANSPARENT);
                 SetTextColor(hdc, text_color);
+
+                const int text_right = vision_active ? (rc.right - 56) : (rc.right - 38);
 
                 // Render Left Indicator (Equalizer bars when Listening, glowing dot otherwise)
                 if (state == HudState::Listening) {
@@ -1089,28 +1171,30 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                     DeleteObject(bar_brush);
 
-                    RECT text_rc{rc.left + 44, rc.top, rc.right - 38, rc.bottom};
-                    DrawTextW(hdc, g_hud_label.c_str(), -1, &text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                    RECT text_rc{rc.left + 44, rc.top, text_right, rc.bottom};
+                    DrawTextW(hdc, hud_label.c_str(), -1, &text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                 } else if (state == HudState::Ready || state == HudState::Paused) {
                     COLORREF dot_color = (state == HudState::Paused) ? RGB(231, 76, 60) : border_color;
                     HBRUSH dot_brush = CreateSolidBrush(dot_color);
-                    SelectObject(hdc, dot_brush);
+                    HGDIOBJ prev_dot_brush = SelectObject(hdc, dot_brush);
                     Ellipse(hdc, rc.left + 14, (rc.bottom - 8) / 2, rc.left + 22, (rc.bottom + 8) / 2);
+                    SelectObject(hdc, prev_dot_brush);
                     DeleteObject(dot_brush);
 
-                    RECT text_rc{rc.left + 28, rc.top, rc.right - 38, rc.bottom};
-                    DrawTextW(hdc, g_hud_label.c_str(), -1, &text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                    RECT text_rc{rc.left + 28, rc.top, text_right, rc.bottom};
+                    DrawTextW(hdc, hud_label.c_str(), -1, &text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                 } else {
-                    RECT text_rc{rc.left + 18, rc.top, rc.right - 38, rc.bottom};
-                    DrawTextW(hdc, g_hud_label.c_str(), -1, &text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                    RECT text_rc{rc.left + 18, rc.top, text_right, rc.bottom};
+                    DrawTextW(hdc, hud_label.c_str(), -1, &text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                 }
 
                 // Render Purple Vision Dot Indicator if Active Window OCR/Vision is Running
-                if (g_vision_active.load()) {
+                if (vision_active) {
                     COLORREF vis_color = RGB(168, 85, 247); // Vivid Purple
                     HBRUSH vis_brush = CreateSolidBrush(vis_color);
-                    SelectObject(hdc, vis_brush);
+                    HGDIOBJ prev_vis_brush = SelectObject(hdc, vis_brush);
                     Ellipse(hdc, rc.right - 50, (rc.bottom - 8) / 2, rc.right - 42, (rc.bottom + 8) / 2);
+                    SelectObject(hdc, prev_vis_brush);
                     DeleteObject(vis_brush);
                 }
 
@@ -1124,9 +1208,11 @@ LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 HBRUSH s_bg = CreateSolidBrush(btn_bg);
                 HPEN s_pen = CreatePen(PS_SOLID, 1, btn_border);
-                SelectObject(hdc, s_bg);
-                SelectObject(hdc, s_pen);
+                HGDIOBJ prev_s_bg = SelectObject(hdc, s_bg);
+                HGDIOBJ prev_s_pen = SelectObject(hdc, s_pen);
                 RoundRect(hdc, stop_btn_rc.left, stop_btn_rc.top, stop_btn_rc.right, stop_btn_rc.bottom, 8, 8);
+                SelectObject(hdc, prev_s_pen);
+                SelectObject(hdc, prev_s_bg);
                 DeleteObject(s_pen);
                 DeleteObject(s_bg);
 
@@ -1243,9 +1329,9 @@ AudioConfig LoadAudioConfig(const std::wstring& custom_dir) {
                         }
 
                         if (key == "input_device") {
-                            cfg.input_device = std::wstring(val.begin(), val.end());
+                            cfg.input_device = jarvis::ui::Utf8ToWide(val);
                         } else if (key == "output_device") {
-                            cfg.output_device = std::wstring(val.begin(), val.end());
+                            cfg.output_device = jarvis::ui::Utf8ToWide(val);
                         }
                     }
                 }
@@ -1474,58 +1560,61 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
 
     g_vad = std::make_unique<jarvis::audio::SileroVad>(g_clean_ring_buffer, vad_model.wstring());
     g_stt = std::make_unique<jarvis::audio::WhisperStt>(whisper_model.string());
-    g_tts = std::make_unique<jarvis::audio::PiperTts>(piper_model.string(), piper_config.string());
+    g_tts = std::make_unique<jarvis::audio::PiperTts>(piper_model.string(), piper_config.string(), audio_cfg.output_device);
 
     // Wire VAD speech-end callback into STT worker queue & IPC audio forwarding
     g_vad->SetUtteranceCallback([](std::vector<float>&& pcm) {
+        if (!jarvis::ui::ShouldDispatchVadUtterance(
+                g_ptt_active.load(std::memory_order_acquire),
+                g_is_paused.load(std::memory_order_acquire))) {
+            return;
+        }
+        ClearTtsQueue();
         if (g_tts) {
             g_tts->BargeIn();
         }
-        if (!g_is_paused.load()) {
-            g_hud_state.store(HudState::Thinking);
-            g_hud_label = L"JARVIS // THINKING...";
-            if (g_hwnd) {
-                PostMessageW(g_hwnd, WM_APP_SPEECH, 0, 0);
+        g_hud.Transition(HudState::Thinking, L"JARVIS // THINKING...");
+        if (g_hwnd) {
+            PostMessageW(g_hwnd, WM_APP_SPEECH, 0, 0);
+        }
+
+        // Assign monotonic non-zero turn_id for this utterance
+        static std::atomic<uint32_t> s_utterance_turn_id{1};
+        uint32_t turn_id = s_utterance_turn_id.fetch_add(1);
+        if (turn_id == 0) turn_id = s_utterance_turn_id.fetch_add(1);
+        g_active_turn_id.store(turn_id, std::memory_order_release);
+        g_latency_tracker.RecordVadEnd(turn_id);
+
+        if (g_stt && g_stt->IsModelLoaded()) {
+            // Pass directly to local on-device Whisper STT engine
+            g_stt->EnqueueUtterance(std::move(pcm));
+        } else if (!pcm.empty()) {
+            // Fallback to sending 16-bit PCM over IPC to daemon for cloud Gemini transcription
+            std::vector<int16_t> pcm16(pcm.size());
+            for (size_t i = 0; i < pcm.size(); ++i) {
+                float s = std::clamp(pcm[i], -1.0f, 1.0f);
+                pcm16[i] = static_cast<int16_t>(s * 32767.0f);
             }
-
-            // Assign monotonic non-zero turn_id for this utterance
-            static std::atomic<uint32_t> s_utterance_turn_id{1};
-            uint32_t turn_id = s_utterance_turn_id.fetch_add(1);
-            if (turn_id == 0) turn_id = s_utterance_turn_id.fetch_add(1);
-            g_active_turn_id.store(turn_id, std::memory_order_release);
-            g_latency_tracker.RecordVadEnd(turn_id);
-
-            if (g_stt && g_stt->IsModelLoaded()) {
-                // Pass directly to local on-device Whisper STT engine
-                g_stt->EnqueueUtterance(std::move(pcm));
-            } else if (!pcm.empty()) {
-                // Fallback to sending 16-bit PCM over IPC to daemon for cloud Gemini transcription
-                std::vector<int16_t> pcm16(pcm.size());
-                for (size_t i = 0; i < pcm.size(); ++i) {
-                    float s = std::clamp(pcm[i], -1.0f, 1.0f);
-                    pcm16[i] = static_cast<int16_t>(s * 32767.0f);
-                }
-                const size_t max_bytes = jarvis::ipc::kMaxAudioPayload;
-                const uint8_t* pcm_bytes = reinterpret_cast<const uint8_t*>(pcm16.data());
-                size_t total_bytes = pcm16.size() * sizeof(int16_t);
-                size_t offset = 0;
-                while (offset < total_bytes) {
-                    size_t chunk_len = std::min(max_bytes, total_bytes - offset);
-                    auto frame = jarvis::ipc::EncodeFrame(
-                        jarvis::ipc::kMsgTypeAudioPcm,
-                        std::string(reinterpret_cast<const char*>(pcm_bytes + offset), chunk_len),
-                        turn_id);
-                    EnqueueIpcFrame(std::move(frame));
-                    offset += chunk_len;
-                }
-                // Send 0-byte EOF frame to mark utterance completion
-                auto eof_frame = jarvis::ipc::EncodeFrame(
+            const size_t max_bytes = jarvis::ipc::kMaxAudioPayload;
+            const uint8_t* pcm_bytes = reinterpret_cast<const uint8_t*>(pcm16.data());
+            size_t total_bytes = pcm16.size() * sizeof(int16_t);
+            size_t offset = 0;
+            while (offset < total_bytes) {
+                size_t chunk_len = std::min(max_bytes, total_bytes - offset);
+                auto frame = jarvis::ipc::EncodeFrame(
                     jarvis::ipc::kMsgTypeAudioPcm,
-                    std::string(),
+                    std::string(reinterpret_cast<const char*>(pcm_bytes + offset), chunk_len),
                     turn_id);
-                EnqueueIpcFrame(std::move(eof_frame));
-                g_latency_tracker.RecordIpcTx(turn_id);
+                EnqueueIpcFrame(std::move(frame));
+                offset += chunk_len;
             }
+            // Send 0-byte EOF frame to mark utterance completion
+            auto eof_frame = jarvis::ipc::EncodeFrame(
+                jarvis::ipc::kMsgTypeAudioPcm,
+                std::string(),
+                turn_id);
+            EnqueueIpcFrame(std::move(eof_frame));
+            g_latency_tracker.RecordIpcTx(turn_id);
         }
     });
 
@@ -1549,8 +1638,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
         g_latency_tracker.RecordIpcTx(turn_id);
 
         if (g_hwnd) {
-            std::wstring wtext(text.begin(), text.end());
-            g_hud_label = L"SPEECH: " + wtext;
+            std::wstring wtext = jarvis::ui::Utf8ToWide(text);
+            g_hud.SetLabelOnly(L"SPEECH: " + wtext);
             PostMessageW(g_hwnd, WM_APP_SPEECH, 0, 0);
         }
     });
@@ -1562,6 +1651,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
 
     std::thread ipc_thread(IpcWorkerLoop);
     std::thread vad_thread(VadWorkerLoop);
+    std::thread tts_synth_thread(TtsSynthWorkerLoop);
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -1570,6 +1660,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
     }
 
     g_running.store(false);
+    g_ipc_out_cv.notify_all();
+    g_tts_queue_cv.notify_all();
+    ClearTtsQueue();
 
     if (g_tts) {
         g_tts->Stop();
@@ -1583,8 +1676,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
         vad_thread.join();
     }
 
+    if (tts_synth_thread.joinable()) {
+        tts_synth_thread.join();
+    }
+
     if (ipc_thread.joinable()) {
-        ipc_thread.detach();
+        ipc_thread.join();
     }
 
     CoUninitialize();

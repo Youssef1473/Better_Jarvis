@@ -339,6 +339,62 @@ fn pcm_to_wav(pcm_bytes: &[u8], sample_rate: u32) -> Vec<u8> {
     wav
 }
 
+async fn send_tts_finalization(out_tx: &tokio::sync::mpsc::Sender<IpcFrame>, turn_id: u32) {
+    let notify = json!({
+        "jsonrpc": "2.0",
+        "method": "tts.speak_chunk",
+        "params": {
+            "turn_id": turn_id,
+            "seq": 0,
+            "text": "",
+            "is_final": true
+        }
+    });
+    if let Ok(payload) = serde_json::to_vec(&notify) {
+        let _ = out_tx
+            .send(IpcFrame {
+                msg_type: MSG_TYPE_CONTROL_JSON,
+                turn_id,
+                payload: Bytes::from(payload),
+            })
+            .await;
+    }
+}
+
+async fn resolve_pcm_transcription_or_cancel<F, Fut>(
+    turn_id: u32,
+    turn_token: &CancellationToken,
+    out_tx: &tokio::sync::mpsc::Sender<IpcFrame>,
+    transcribe_fn: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    let res = tokio::select! {
+        biased;
+        _ = turn_token.cancelled() => {
+            info!("Cancelled in-flight audio transcription (turn_id={})", turn_id);
+            return None;
+        }
+        r = transcribe_fn() => r,
+    };
+
+    match res {
+        Ok(t) if !t.trim().is_empty() => Some(t),
+        Ok(_) => {
+            info!("Gemini transcribed silence/empty (turn_id={})", turn_id);
+            send_tts_finalization(out_tx, turn_id).await;
+            None
+        }
+        Err(e) => {
+            warn!("Gemini audio transcription failed (turn_id={}): {e}", turn_id);
+            send_tts_finalization(out_tx, turn_id).await;
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_utterance(
     utterance: String,
@@ -400,6 +456,8 @@ async fn process_utterance(
                 if let Ok(payload) = serde_json::to_vec(&tts_notify) {
                     let _ = out_tx.send(IpcFrame { msg_type: MSG_TYPE_CONTROL_JSON, turn_id, payload: Bytes::from(payload) }).await;
                 }
+            } else {
+                send_tts_finalization(&out_tx, turn_id).await;
             }
 
             telemetry.record_completed_turn(active_timing);
@@ -484,7 +542,7 @@ async fn process_utterance(
                     &turn_token,
                     Some(tts_chunk_tx),
                     move || {
-                        let mut g = t_first_token_clone.lock().unwrap();
+                        let mut g = t_first_token_clone.lock().unwrap_or_else(|e| e.into_inner());
                         if g.is_none() {
                             *g = Some(std::time::Instant::now());
                         }
@@ -494,7 +552,7 @@ async fn process_utterance(
 
             let first_tts = forwarder.await.ok().flatten();
             active_timing.t_first_tts_dispatch = first_tts;
-            active_timing.t_llm_first_token = *t_first_token.lock().unwrap();
+            active_timing.t_llm_first_token = *t_first_token.lock().unwrap_or_else(|e| e.into_inner());
             active_timing.t_llm_done = Some(std::time::Instant::now());
 
             match res {
@@ -504,8 +562,13 @@ async fn process_utterance(
                         crate::agent::model_router::ModelTier::Fast => telemetry::ExecutionPath::CloudFast,
                         crate::agent::model_router::ModelTier::Heavy => telemetry::ExecutionPath::CloudHeavy,
                         crate::agent::model_router::ModelTier::Fallback => telemetry::ExecutionPath::CloudFast,
+                        crate::agent::model_router::ModelTier::LocalFallback => telemetry::ExecutionPath::LocalFallback,
                     };
                     active_timing.routing_reason = model_sel.reason.to_string();
+
+                    if first_tts.is_none() {
+                        send_tts_finalization(&out_tx, turn_id).await;
+                    }
 
                     if let Some(id) = ack_req_id {
                         let ack = JsonRpcResponse {
@@ -624,29 +687,14 @@ async fn handle_client(
                         info!("Received {} bytes audio PCM chunk from host (turn_id={})", frame.payload.len(), turn_id);
                         if let Some(assembled_pcm) = pcm_reassembler.handle_frame(frame.turn_id, &frame.payload) {
                             if assembled_pcm.len() >= 3200 {
-                                if let Some(prev) = active_turn_token.lock().unwrap().take() {
+                                if let Some(prev) = active_turn_token.lock().unwrap_or_else(|e| e.into_inner()).take() {
                                     info!("Cancelling previous in-flight turn for incoming audio utterance");
                                     prev.cancel();
                                 }
                                 let turn_token = shutdown_token.child_token();
-                                *active_turn_token.lock().unwrap() = Some(turn_token.clone());
+                                *active_turn_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(turn_token.clone());
 
                                 let wav = pcm_to_wav(&assembled_pcm, 16000);
-                                let transcribed = match gemini.transcribe_audio(&wav).await {
-                                    Ok(t) if !t.is_empty() => t,
-                                    Ok(_) => {
-                                        info!("Gemini transcribed silence/empty");
-                                        *active_turn_token.lock().unwrap() = None;
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        warn!("Gemini audio transcription failed: {e}");
-                                        *active_turn_token.lock().unwrap() = None;
-                                        continue;
-                                    }
-                                };
-                                info!("Transcribed voice command: \"{}\"", transcribed);
-
                                 let t_rx = std::time::Instant::now();
                                 let policy_c = policy.clone();
                                 let conf_c = confirmation_mgr.clone();
@@ -658,6 +706,18 @@ async fn handle_client(
                                 let token_c = turn_token.clone();
 
                                 tokio::spawn(async move {
+                                    let Some(transcribed) = resolve_pcm_transcription_or_cancel(
+                                        turn_id,
+                                        &token_c,
+                                        &out_c,
+                                        || gemini_c.transcribe_audio(&wav),
+                                    )
+                                    .await
+                                    else {
+                                        return;
+                                    };
+
+                                    info!("Transcribed voice command: \"{}\"", transcribed);
                                     let _ = process_utterance(
                                         transcribed,
                                         turn_id,
@@ -671,8 +731,12 @@ async fn handle_client(
                                         telem_c,
                                         t_rx,
                                         None,
-                                    ).await;
+                                    )
+                                    .await;
                                 });
+                            } else {
+                                info!("Ignoring short audio PCM utterance ({} samples, turn_id={})", assembled_pcm.len(), turn_id);
+                                send_tts_finalization(&out_tx, turn_id).await;
                             }
                         }
                     }
@@ -707,7 +771,7 @@ async fn handle_client(
                                 .await;
                         } else if req.method == "system.barge_in" {
                             info!("Received system.barge_in RPC; cancelling active turn");
-                            let was_active = if let Some(token) = active_turn_token.lock().unwrap().take() {
+                            let was_active = if let Some(token) = active_turn_token.lock().unwrap_or_else(|e| e.into_inner()).take() {
                                 token.cancel();
                                 true
                             } else {
@@ -756,12 +820,12 @@ async fn handle_client(
                                 .unwrap_or_default();
                             info!("Speech recognized: \"{}\" ({} ms)", text, duration_ms);
 
-                            if let Some(prev) = active_turn_token.lock().unwrap().take() {
+                            if let Some(prev) = active_turn_token.lock().unwrap_or_else(|e| e.into_inner()).take() {
                                 info!("Cancelling previous in-flight turn for incoming transcribed speech");
                                 prev.cancel();
                             }
                             let turn_token = shutdown_token.child_token();
-                            *active_turn_token.lock().unwrap() = Some(turn_token.clone());
+                            *active_turn_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(turn_token.clone());
 
                             let t_rx = std::time::Instant::now();
                             let policy_c = policy.clone();
@@ -834,9 +898,16 @@ async fn handle_client(
                             let tier = req.params.get("tier").and_then(|v| v.as_str()).unwrap_or("preference");
 
                             let res = if !key.is_empty() {
-                                let _ = memory.db().upsert_fact(key, val, tier).await;
-                                let _ = memory.sync().export_profile_atomic().await;
-                                true
+                                match memory.upsert_fact(key, val, tier, true).await {
+                                    Ok(()) => {
+                                        let _ = memory.sync().export_profile_atomic().await;
+                                        true
+                                    }
+                                    Err(e) => {
+                                        error!("memory.upsert_fact failed for key '{}': {}", key, e);
+                                        false
+                                    }
+                                }
                             } else {
                                 false
                             };
@@ -947,5 +1018,45 @@ mod tests {
     fn test_global_crypto_provider_installed() {
         ensure_crypto_provider_installed();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_pcm_transcription_emits_finalization_on_empty_and_respects_barge_in_cancel() {
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<IpcFrame>(8);
+        let token = CancellationToken::new();
+
+        // 1. Empty transcription must emit is_final=true tts.speak_chunk so HUD exits Thinking
+        let res = resolve_pcm_transcription_or_cancel(55, &token, &out_tx, || async {
+            Ok("   ".to_string())
+        })
+        .await;
+        assert!(res.is_none());
+        let frame = out_rx
+            .try_recv()
+            .expect("empty transcription must emit HUD finalization frame");
+        assert_eq!(frame.turn_id, 55);
+        let val: Value = serde_json::from_slice(&frame.payload).unwrap();
+        assert_eq!(val["method"], "tts.speak_chunk");
+        assert_eq!(val["params"]["is_final"], true);
+        assert_eq!(val["params"]["text"], "");
+
+        // 2. Barge-in cancellation must abort slow transcription immediately without emitting frame
+        let slow_token = CancellationToken::new();
+        let cancel_clone = slow_token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel_clone.cancel();
+        });
+        let cancelled_res = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            resolve_pcm_transcription_or_cancel(56, &slow_token, &out_tx, || async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok("should be cancelled".to_string())
+            }),
+        )
+        .await
+        .expect("transcription must cancel promptly on barge-in");
+        assert!(cancelled_res.is_none());
+        assert!(out_rx.try_recv().is_err());
     }
 }

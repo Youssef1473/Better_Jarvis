@@ -97,5 +97,7 @@ foreach ($Asset in $Assets) {
     Write-Host "[VERIFIED] $($Asset.Name) ($Hash)" -ForegroundColor Green
 }
 
-$NewManifestLines | Set-Content -Path $ManifestPath -Encoding UTF8
+$ManifestOutPath = Join-Path $ModelDir "manifest.sha256"
+$ManifestContent = ($NewManifestLines -join "`r`n") + "`r`n"
+[System.IO.File]::WriteAllText($ManifestOutPath, $ManifestContent, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "`nAll models ready in $ModelDir" -ForegroundColor Green

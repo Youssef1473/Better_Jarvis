@@ -208,3 +208,64 @@
   3. Add `dist/` and `scripts/__pycache__/` to `.gitignore`. Remove unneeded `scripts/run-cargo.py`.
   4. Verify Rust panic secret-scrubbing test `diagnostics::tests::test_secret_scrubbing`.
 - **Exit Gate**: `scripts/verify-v1.ps1` passes all 6 production gates end-to-end.
+
+### TICKET-16.2: Audio PTT Onset, Watchdog & Device Selection (`77d6d4c`)
+- **Objective**: Eliminate startup audio feedback loops, support explicit audio device selection, and guard against stuck listening states.
+- **Implementation**:
+  1. Implemented silent PTT onset with 300 ms `PeekRecent` pre-roll, PTT release duration/RMS gating (`>= 250 ms`, `RMS >= 0.0001`), and a 15-second listening watchdog in `host-cpp/src/main.cpp`.
+  2. Added `--probe-mic`, `[audio]` config parsing, and substring-based `WasapiCapture` device selection (`--input-device` / `--output-device`).
+
+### TICKET-17: Dual-Provider Gemini Routing, Ordered Tool Scheduler & HUD Watchdog (`172ed2c`)
+- **Objective**: Support Vertex AI Enterprise + AI Studio fallback routing, parallel read-only tool execution, and a pure-evaluated thinking watchdog.
+- **Implementation**:
+  1. Added `fallback_model`, per-tier `max_output_tokens_*`, and `[enterprise]` ADC/Vertex AI routing in `daemon-rust/src/config.rs`, `model_router.rs`, and `gemini_client.rs`.
+  2. Implemented ordered parallel/serialized tool scheduler (`ToolExecutionClass`, `execute_parallel_tool_calls`) preserving `thoughtSignature` and taint propagation.
+  3. Extracted `HudState` (`host-cpp/include/ui/hud_state.hpp`) and `EvaluateThinkingWatchdog` (`host-cpp/include/ui/hud_watchdog.hpp`) with unit tests in `host-cpp/tests/test_hud_watchdog.cpp`.
+
+---
+
+## Phase 4: Stabilization, Security Edge Closure & Modularization
+
+### TICKET-18: P0 Concurrency, Streaming TTS Finalization & Blocking-Voice-Loop Fix
+- **Objective**: Eliminate cross-thread HUD races/GDI leaks, prevent TTS synthesis and cloud audio transcription from blocking IPC/barge-in, and fix stuck `Thinking` HUD states.
+- **Tasks**:
+  1. **`host-cpp/src/main.cpp` & UI Watchdog (`host-cpp/include/ui/hud_watchdog.hpp`)**:
+     - Guard `g_hud_label` and HUD state updates with a mutex/thread-safe helper; restore prior `HGDIOBJ` via `SelectObject` before `DeleteObject` in `WM_PAINT`.
+     - Offload `g_tts->Speak(text)` from `IpcWorkerLoop` onto a dedicated cancellable/turn-filtered TTS synthesis worker thread so `IpcWorkerLoop` never blocks on ONNX/eSpeak.
+     - Anchor `EvaluateThinkingWatchdog` to a dedicated `g_thinking_start_time` updated on transitions into `HudState::Thinking`; suppress `VadWorkerLoop` utterance triggers while `g_ptt_active` is true; assign `ptt_turn` before calling `RecordPttUp`; join `ipc_thread` cleanly on exit instead of detaching.
+  2. **`daemon-rust/src/main.rs`, `gemini_client.rs`, `diagnostics.rs`, `telemetry.rs`**:
+     - Move `MSG_TYPE_AUDIO_PCM` cloud transcription off `handle_client`'s `select!` loop into a `tokio::spawn` task selectable against `turn_token.cancelled()`, and emit `tts.speak_chunk` (`is_final: true`, empty text) on empty/failed transcription or empty LLM reply so the host HUD never stalls in `Thinking`.
+     - Fix `parse_sse_bytes_stream_full` to finalize emitted pre-tool text chunks cleanly and prevent unfinalized TTS streams on tool turns.
+     - Replace `.lock().unwrap()` with poison-recovering locking (`unwrap_or_else(|e| e.into_inner())`) in `diagnostics.rs`, `telemetry.rs`, and `main.rs`.
+- **Exit Gate**: `cargo test --manifest-path daemon-rust/Cargo.toml`, `cargo clippy --manifest-path daemon-rust/Cargo.toml --all-targets -- -D warnings`, and `host-cpp` release + C++ unit tests pass cleanly with new regression tests covering TTS finalization, thinking-start watchdog tracking, and non-blocking turn cancellation.
+
+### TICKET-19: Security Edge-Case Closure (`browser_cdp`, `os_control`, `sandbox`)
+- **Objective**: Remove remaining fail-open fallbacks and TOCTOU/SSRF gaps in tool execution.
+- **Tasks**:
+  1. Remove `explorer.exe <url>` fallback in `daemon-rust/src/tools/browser_cdp.rs` when Chromium/CDP fails; harden `validate_navigation_url` against RFC1918, hex/int IPs, and `user@host` userinfo bypasses.
+  2. Replace bare executable names (`code.cmd`, `chrome.exe`) in `os_control.rs` with resolved absolute paths and fix `"open discord"` router/allowlist mismatch.
+  3. Spawn sandboxed child processes in `daemon-rust/src/security/sandbox.rs` with `CREATE_SUSPENDED` prior to `JobObjectGuard::assign_process`, and align `policy.rs` dangerous-flag checks (`rg --pre`, `fd -x`).
+- **Exit Gate**: Adversarial unit tests for SSRF URLs, `CREATE_SUSPENDED` job assignment, and zero bare-name launches pass cleanly.
+
+### TICKET-20: Config/TOML Hardening, Audio Output Parity & Test/Packaging Alignment
+- **Objective**: Eliminate silent config parsing failures, wire `--output-device` + TTS render hot-swap, and align CMake/PS1/WiX verification gates.
+- **Tasks**:
+  1. Replace hand-rolled TOML parsing in `daemon-rust/src/config.rs` with `toml` + `serde`, respect `[ai].provider`, fail/fall back explicitly on empty `enterprise.project_id`, replace hardcoded user paths in `config/config.toml`, and add `.env.example`.
+  2. Wire `--output-device` into `PiperTts` and add `AUDCLNT_E_DEVICE_INVALIDATED` render endpoint recovery in `host-cpp/src/audio/piper_tts.cpp`.
+  3. Wire `test_hud_watchdog.cpp` and `test_operational_throughput.cpp` into `scripts/verify-v1.ps1` and `host-cpp/CMakeLists.txt` (`enable_testing()`), replace `assert()` in C++ tests with an always-active `TEST_ASSERT`, fix UTF-8 BOM in `scripts/setup-models.ps1`, align `packaging/better_jarvis.wxs`, and update `.agents/docs/` references to `verify-v1.ps1`.
+- **Exit Gate**: `scripts/verify-v1.ps1` passes all 6 gates including all 12 C++ test suites and updated packaging/config checks.
+
+### TICKET-21: `gemini_client.rs` Modularization & Partially-Wired Capabilities
+- **Objective**: Decompose the 6,265-line `gemini_client.rs` monolith and wire built-in security/memory/browser capabilities into the agent loop.
+- **Tasks**:
+  1. Split `daemon-rust/src/agent/gemini_client.rs` into focused modules (`auth_adc.rs`, `sse_parser.rs`, `tool_schemas.rs`, `tool_scheduler.rs`, `react_loop.rs`) and deduplicate `max_output_tokens_for_model` and guarded tool execution helpers.
+  2. Wire `PolicyEngine::open_validated_file` as sandboxed read/list agent tools, query `facts_vec` in semantic recall, route `memory.upsert_fact` through `LocalEmbedder`, and expose `Accessibility.getFullAXTree` / `g_vision_app` HUD display.
+- **Exit Gate**: Full Rust + C++ test suites pass with zero regressions and reduced module complexity.
+
+### TICKET-22: Local Ollama Fallback Provider (`qwen3.5:2b`) on Gemini Quota/Availability Failure
+- **Objective**: Keep Jarvis operational offline and under Gemini free-tier quota exhaustion (`HTTP 429` / `RESOURCE_EXHAUSTED` / missing API key / network outage) by transparently falling back to local Ollama (`qwen3.5:2b`) while preserving all tool-calling, sandboxing, taint tracking, and streaming TTS guarantees.
+- **Tasks**:
+  1. **`daemon-rust/src/config.rs` & `config/config.toml`**: Add `[ai.local_fallback]` (`enabled`, `provider`, `base_url`, `model = "qwen3.5:2b"`, `max_output_tokens`, `timeout_secs`), enforce strict loopback-only URL validation (`127.0.0.1` / `localhost` / `[::1]`, zero userinfo), and support `[ai] provider = "ollama"` local-first mode.
+  2. **`daemon-rust/src/agent/ollama_client.rs` & `tool_schemas.rs`**: Convert `get_tool_declarations()` into Ollama/OpenAI `tools` JSON Schema without duplicating definitions, implement `/api/chat` NDJSON streaming with `<think>...</think>` stripping before `SentenceChunker`, require `"done": true` before dispatching tool calls, and reuse `tool_scheduler` ordered execution + nonced wrapping + taint propagation.
+  3. **`daemon-rust/src/agent/gemini_client.rs`, `react_loop.rs`, `telemetry.rs`, `main.rs`**: Add typed fallback-eligible Gemini errors (`429`/quota, missing key, transport failure — never `SAFETY` or `CancellationToken`), wire automatic Turn-1 fallback into `chat_with_tools_streaming*`, and record `ExecutionPath::LocalFallback`.
+- **Exit Gate**: `cargo test` (with simulated `HTTP 429` -> Ollama NDJSON tool-loop & loopback URL rejection tests) and `cargo clippy --all-targets -- -D warnings` pass with zero warnings, followed by independent adversarial review.

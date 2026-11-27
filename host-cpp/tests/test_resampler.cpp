@@ -1,4 +1,4 @@
-#include <cassert>
+#include "test_assert.hpp"
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -112,22 +112,22 @@ void Test48kStereoResampling() {
 
         size_t mono_count = harness.ConvertToMono(
             stereo_in.data(), 480, 2, mono_scratch.data(), kMaxScratch);
-        assert(mono_count == 480);
+        TEST_ASSERT(mono_count == 480);
 
         for (size_t i = 0; i < mono_count; ++i) {
-            assert(std::abs(mono_scratch[i] - 0.5f) < 1e-4f);
+            TEST_ASSERT(std::abs(mono_scratch[i] - 0.5f) < 1e-4f);
         }
 
         size_t out_count = harness.ResampleTo16k(
             mono_scratch.data(), mono_count, 48000.0, resample_scratch.data(), kMaxScratch);
-        assert(out_count == 160);
+        TEST_ASSERT(out_count == 160);
         total_out += out_count;
 
         for (size_t i = 0; i < out_count; ++i) {
-            assert(std::abs(resample_scratch[i] - 0.5f) < 1e-4f);
+            TEST_ASSERT(std::abs(resample_scratch[i] - 0.5f) < 1e-4f);
         }
     }
-    assert(total_out == 1600);
+    TEST_ASSERT(total_out == 1600);
 }
 
 void Test441kStereoResamplingPhaseContinuity() {
@@ -148,17 +148,17 @@ void Test441kStereoResamplingPhaseContinuity() {
 
         size_t mono_count = harness.ConvertToMono(
             stereo_in.data(), 441, 2, mono_scratch.data(), kMaxScratch);
-        assert(mono_count == 441);
+        TEST_ASSERT(mono_count == 441);
 
         size_t out_count = harness.ResampleTo16k(
             mono_scratch.data(), mono_count, 44100.0, resample_scratch.data(), kMaxScratch);
         total_out += out_count;
 
         for (size_t i = 0; i < out_count; ++i) {
-            assert(std::abs(resample_scratch[i] - 0.5f) < 1e-4f);
+            TEST_ASSERT(std::abs(resample_scratch[i] - 0.5f) < 1e-4f);
         }
     }
-    assert(total_out == 1600);
+    TEST_ASSERT(total_out == 1600);
 }
 
 void Test16kPassThrough() {
@@ -174,9 +174,9 @@ void Test16kPassThrough() {
 
     size_t out_count = harness.ResampleTo16k(
         in.data(), in.size(), 16000.0, resample_scratch.data(), kMaxScratch);
-    assert(out_count == 320);
+    TEST_ASSERT(out_count == 320);
     for (size_t i = 0; i < 320; ++i) {
-        assert(resample_scratch[i] == in[i]);
+        TEST_ASSERT(resample_scratch[i] == in[i]);
     }
 }
 
@@ -187,21 +187,21 @@ void TestDiscontinuityReset() {
     // Feed a burst at 44.1 kHz
     std::vector<float> burst1(441, 0.7f);
     size_t out1 = harness.ResampleTo16k(burst1.data(), burst1.size(), 44100.0, scratch.data(), kMaxScratch);
-    assert(out1 > 0);
-    assert(harness.has_last_sample);
+    TEST_ASSERT(out1 > 0);
+    TEST_ASSERT(harness.has_last_sample);
 
     // Signal discontinuity
     harness.ResetDiscontinuity();
-    assert(!harness.has_last_sample);
-    assert(harness.resample_phase == 0.0);
-    assert(harness.last_input_sample == 0.0f);
+    TEST_ASSERT(!harness.has_last_sample);
+    TEST_ASSERT(harness.resample_phase == 0.0);
+    TEST_ASSERT(harness.last_input_sample == 0.0f);
 
     // Next packet starts cleanly with no leftover phase corruption
     std::vector<float> burst2(441, 0.3f);
     size_t out2 = harness.ResampleTo16k(burst2.data(), burst2.size(), 44100.0, scratch.data(), kMaxScratch);
-    assert(out2 > 0);
+    TEST_ASSERT(out2 > 0);
     for (size_t i = 0; i < out2; ++i) {
-        assert(std::abs(scratch[i] - 0.3f) < 1e-4f);
+        TEST_ASSERT(std::abs(scratch[i] - 0.3f) < 1e-4f);
     }
 }
 
@@ -227,13 +227,13 @@ void TestSineWaveContinuousPhaseNoClicks() {
     }
 
     // Output must be exactly 1600 samples (100 ms @ 16 kHz)
-    assert(output.size() == 1600);
+    TEST_ASSERT(output.size() == 1600);
 
     // Verify there are no boundary clicks: maximum sample-to-sample difference
     // in 440 Hz sine wave @ 16 kHz is bounded by 2 * pi * 440 / 16000 ~ 0.173
     for (size_t i = 1; i < output.size(); ++i) {
         float delta = std::abs(output[i] - output[i - 1]);
-        assert(delta < 0.25f);
+        TEST_ASSERT(delta < 0.25f);
     }
 }
 

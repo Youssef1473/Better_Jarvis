@@ -16,6 +16,7 @@ pub enum ExecutionPath {
     FastPath,
     CloudFast,
     CloudHeavy,
+    LocalFallback,
 }
 
 impl ExecutionPath {
@@ -28,6 +29,7 @@ impl ExecutionPath {
             ExecutionPath::FastPath => "fast_path",
             ExecutionPath::CloudFast => "cloud_fast",
             ExecutionPath::CloudHeavy => "cloud_heavy",
+            ExecutionPath::LocalFallback => "local_fallback",
         }
     }
 }
@@ -223,7 +225,7 @@ impl DaemonTelemetry {
     }
 
     pub fn insert_record(&self, record: TurnTelemetryRecord) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let target_deque = if record.path.is_fast_path() {
             &mut inner.fast_path_turns
         } else {
@@ -237,7 +239,7 @@ impl DaemonTelemetry {
     }
 
     pub fn get_summary(&self) -> TelemetrySummary {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         let fast_durations: Vec<f64> = inner
             .fast_path_turns
@@ -376,5 +378,19 @@ mod tests {
         let deserialized: TurnTelemetryRecord = serde_json::from_str(&json_str).unwrap();
         assert_eq!(deserialized.memory_recall_ms, Some(8.75));
         assert_eq!(deserialized.turn_id, 42);
+    }
+
+    #[test]
+    fn test_telemetry_recovers_from_poisoned_mutex() {
+        let telemetry = std::sync::Arc::new(DaemonTelemetry::new());
+        let telemetry_clone = telemetry.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = telemetry_clone.inner.lock().unwrap();
+            panic!("simulated panic while holding telemetry lock");
+        })
+        .join();
+
+        let summary = telemetry.get_summary();
+        assert_eq!(summary.total_turns_in_window, 0);
     }
 }

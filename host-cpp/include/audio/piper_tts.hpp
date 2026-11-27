@@ -19,6 +19,8 @@
 
 namespace jarvis::audio {
 
+class RenderDeviceNotifier;
+
 /// Low-latency Piper TTS synthesis and WASAPI render engine.
 /// Runs playback on a dedicated Core 0 thread (0x03 mask) with MMCSS "Pro Audio" priority,
 /// supporting sub-20 ms epoch-based barge-in and feeding a lock-free far-end reference buffer for AEC.
@@ -27,7 +29,10 @@ public:
     static constexpr double kPiperSampleRate = 22050.0;
     static constexpr double kRefSampleRate   = 16000.0;
 
-    explicit PiperTts(const std::string& model_path = "", const std::string& config_path = "");
+    explicit PiperTts(
+        const std::string& model_path = "",
+        const std::string& config_path = "",
+        const std::wstring& target_device = L"default");
     ~PiperTts();
 
     // Non-copyable, non-movable
@@ -66,6 +71,34 @@ public:
     /// Current speech epoch counter.
     uint64_t CurrentEpoch() const noexcept { return playback_epoch_.load(std::memory_order_relaxed); }
 
+    /// Sets or updates the target audio render device name (supports case-insensitive substring match).
+    void SetTargetDeviceName(const std::wstring& target_device) {
+        target_device_name_ = target_device;
+    }
+    const std::wstring& TargetDeviceName() const noexcept {
+        return target_device_name_;
+    }
+    std::wstring ActiveDeviceFriendlyName() const {
+        return active_friendly_name_;
+    }
+
+    /// Triggers an asynchronous render endpoint re-initialization (e.g. on hot-swap).
+    void RequestReinit() noexcept {
+        reinit_requested_.store(true, std::memory_order_release);
+    }
+    bool IsReinitRequested() const noexcept {
+        return reinit_requested_.load(std::memory_order_acquire);
+    }
+
+    /// Classifies WASAPI render HRESULTs that indicate device disconnection/invalidation.
+    static bool IsDeviceInvalidatedHresult(HRESULT hr) noexcept {
+        constexpr HRESULT kResourcesInvalidated = static_cast<HRESULT>(0x88890026L);
+        constexpr HRESULT kServiceNotRunning = static_cast<HRESULT>(0x88890010L);
+        return hr == AUDCLNT_E_DEVICE_INVALIDATED ||
+               hr == kResourcesInvalidated ||
+               hr == kServiceNotRunning;
+    }
+
     /// Exposes the lock-free SPSC Far-End Reference Ring Buffer (16 kHz mono float)
     /// fed synchronously with speaker playback for Acoustic Echo Cancellation.
     SpscRingBuffer<32768>& FarEndReferenceBuffer() noexcept { return far_end_ref_; }
@@ -92,11 +125,17 @@ private:
 
     void RenderThreadLoop();
     bool InitRenderEndpoint(HANDLE event_handle);
+    void CleanupRenderEndpoint() noexcept;
     void SynthesizeInternal(const std::string& text, uint64_t epoch, std::vector<float>& pcm_out);
 
 private:
     std::thread             render_thread_;
     std::atomic<bool>       running_{false};
+    std::atomic<bool>       reinit_requested_{false};
+
+    std::wstring            target_device_name_{L"default"};
+    std::wstring            active_friendly_name_{L"Default Render Device"};
+    RenderDeviceNotifier*   notifier_{nullptr};
 
     // Monotonic playback epoch and speaking status
     alignas(64) std::atomic<uint64_t> playback_epoch_{0};

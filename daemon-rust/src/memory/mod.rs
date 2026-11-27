@@ -119,6 +119,23 @@ impl MemoryEngine {
         self.db.hybrid_search(query, query_emb.as_deref(), limit).await
     }
 
+    /// Searches stored user/system facts using `facts_vec` cosine KNN + keyword fallback.
+    pub async fn search_facts(&self, query: &str, limit: usize) -> Result<Vec<(db::FactRecord, f32)>> {
+        let trimmed = query.trim();
+        let query_emb = if !trimmed.is_empty() {
+            if let Some(e) = &self.embedder {
+                e.embed(trimmed).await.ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.db
+            .search_facts_semantic(query, query_emb.as_deref(), limit)
+            .await
+    }
+
     /// Formats all stored profile facts as a context block for the Gemini agent (legacy compatibility).
     pub async fn format_context_for_prompt(&self) -> String {
         let mut taint = TurnTaintState::new();
@@ -126,7 +143,28 @@ impl MemoryEngine {
         self.retrieve_context_for_turn("", 2048, &mut taint, &nonce).await
     }
 
-    /// Formats relevant memory context (facts + hybrid search notes) for the Gemini turn prompt.
+    fn push_fact_entry(
+        out: &mut String,
+        fact: &db::FactRecord,
+        taint: &mut TurnTaintState,
+        turn_nonce: &str,
+    ) {
+        if !fact.source_trusted {
+            taint.mark_tainted("memory:untrusted_note");
+            let fact_str = format!("- {}: {}", fact.key, fact.value);
+            let wrapped = policy::wrap_untrusted_content_with_nonce(
+                "memory:untrusted_note",
+                &fact_str,
+                turn_nonce,
+            );
+            out.push_str(&wrapped);
+            out.push('\n');
+        } else {
+            out.push_str(&format!("- {}: {}\n", fact.key, fact.value));
+        }
+    }
+
+    /// Formats relevant memory context (semantic facts + hybrid search notes) for the Gemini turn prompt.
     /// Any untrusted notes immediately escalate taint state and are enclosed in cryptographic nonce boundaries.
     pub async fn retrieve_context_for_turn(
         &self,
@@ -137,24 +175,25 @@ impl MemoryEngine {
     ) -> String {
         let mut out = String::new();
 
-        // 1. Facts (System preferences & user profile)
-        if let Ok(facts) = self.db.list_facts().await {
-            if !facts.is_empty() {
-                out.push_str("User Profile & System Preferences:\n");
-                for fact in facts {
-                    if !fact.source_trusted {
-                        taint.mark_tainted("memory:untrusted_note");
-                        let fact_str = format!("- {}: {}", fact.key, fact.value);
-                        let wrapped = policy::wrap_untrusted_content_with_nonce(
-                            "memory:untrusted_note",
-                            &fact_str,
-                            turn_nonce,
-                        );
-                        out.push_str(&wrapped);
-                        out.push('\n');
-                    } else {
-                        out.push_str(&format!("- {}: {}\n", fact.key, fact.value));
-                    }
+        // 1. Facts (Semantic `facts_vec` matches first when query is non-empty, then remaining profile facts)
+        let mut seen_keys = std::collections::HashSet::new();
+        let semantic_facts = if !query.trim().is_empty() {
+            self.search_facts(query, 8).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let all_facts = self.db.list_facts().await.unwrap_or_default();
+
+        if !semantic_facts.is_empty() || !all_facts.is_empty() {
+            out.push_str("User Profile & System Preferences:\n");
+            for (fact, _score) in semantic_facts {
+                if seen_keys.insert(fact.key.clone()) {
+                    Self::push_fact_entry(&mut out, &fact, taint, turn_nonce);
+                }
+            }
+            for fact in all_facts {
+                if seen_keys.insert(fact.key.clone()) {
+                    Self::push_fact_entry(&mut out, &fact, taint, turn_nonce);
                 }
             }
         }

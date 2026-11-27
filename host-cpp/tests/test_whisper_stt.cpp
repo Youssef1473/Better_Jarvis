@@ -1,4 +1,4 @@
-#include <cassert>
+#include "test_assert.hpp"
 #include <cmath>
 #include <filesystem>
 #include <iostream>
@@ -9,33 +9,33 @@
 using namespace jarvis::audio;
 
 void TestSanitizeTranscript() {
-    assert(WhisperStt::SanitizeTranscript("   hello world   ") == "hello world");
-    assert(WhisperStt::SanitizeTranscript("\n\t\"open youtube\"\r\n") == "open youtube");
-    assert(WhisperStt::SanitizeTranscript("   ") == "");
-    assert(WhisperStt::SanitizeTranscript("\"\"") == "");
-    assert(WhisperStt::SanitizeTranscript("volume up") == "volume up");
+    TEST_ASSERT(WhisperStt::SanitizeTranscript("   hello world   ") == "hello world");
+    TEST_ASSERT(WhisperStt::SanitizeTranscript("\n\t\"open youtube\"\r\n") == "open youtube");
+    TEST_ASSERT(WhisperStt::SanitizeTranscript("   ") == "");
+    TEST_ASSERT(WhisperStt::SanitizeTranscript("\"\"") == "");
+    TEST_ASSERT(WhisperStt::SanitizeTranscript("volume up") == "volume up");
 }
 
 void TestHallucinationFilter() {
     // Classic Whisper silent hallucinations must be rejected
-    assert(WhisperStt::IsHallucination("[BLANK_AUDIO]"));
-    assert(WhisperStt::IsHallucination("[blank_audio]"));
-    assert(WhisperStt::IsHallucination("(silence)"));
-    assert(WhisperStt::IsHallucination("[Music]"));
-    assert(WhisperStt::IsHallucination("(music)"));
-    assert(WhisperStt::IsHallucination("[applause]"));
-    assert(WhisperStt::IsHallucination("Thanks for watching!"));
-    assert(WhisperStt::IsHallucination("Thank you."));
-    assert(WhisperStt::IsHallucination("..."));
-    assert(WhisperStt::IsHallucination("."));
-    assert(WhisperStt::IsHallucination("???"));
-    assert(WhisperStt::IsHallucination(""));
+    TEST_ASSERT(WhisperStt::IsHallucination("[BLANK_AUDIO]"));
+    TEST_ASSERT(WhisperStt::IsHallucination("[blank_audio]"));
+    TEST_ASSERT(WhisperStt::IsHallucination("(silence)"));
+    TEST_ASSERT(WhisperStt::IsHallucination("[Music]"));
+    TEST_ASSERT(WhisperStt::IsHallucination("(music)"));
+    TEST_ASSERT(WhisperStt::IsHallucination("[applause]"));
+    TEST_ASSERT(WhisperStt::IsHallucination("Thanks for watching!"));
+    TEST_ASSERT(WhisperStt::IsHallucination("Thank you."));
+    TEST_ASSERT(WhisperStt::IsHallucination("..."));
+    TEST_ASSERT(WhisperStt::IsHallucination("."));
+    TEST_ASSERT(WhisperStt::IsHallucination("???"));
+    TEST_ASSERT(WhisperStt::IsHallucination(""));
 
     // Real voice commands must pass
-    assert(!WhisperStt::IsHallucination("open youtube"));
-    assert(!WhisperStt::IsHallucination("what is my schedule today?"));
-    assert(!WhisperStt::IsHallucination("turn the volume down"));
-    assert(!WhisperStt::IsHallucination("git status"));
+    TEST_ASSERT(!WhisperStt::IsHallucination("open youtube"));
+    TEST_ASSERT(!WhisperStt::IsHallucination("what is my schedule today?"));
+    TEST_ASSERT(!WhisperStt::IsHallucination("turn the volume down"));
+    TEST_ASSERT(!WhisperStt::IsHallucination("git status"));
 }
 
 void TestQueueBoundingAndBargeIn() {
@@ -67,7 +67,7 @@ void TestRealWhisperStt() {
     }
 
     WhisperStt stt(model_path.string());
-    assert(stt.IsModelLoaded());
+    TEST_ASSERT(stt.IsModelLoaded());
 
     // Generate 1 second of synthetic 16 kHz audio
     std::vector<float> audio(16000, 0.0f);

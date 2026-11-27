@@ -1,0 +1,43 @@
+{
+  "better-jarvis-guardrails": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python scripts/guardrail.py session_start",
+        "timeout": 10
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "run_command|write_file|edit_file|write_to_file|replace_file_content|multi_replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/guardrail.py pre_tool",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/guardrail.py post_tool",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python scripts/guardrail.py stop",
+        "timeout": 10
+      }
+    ]
+  }
+}

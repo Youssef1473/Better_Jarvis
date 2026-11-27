@@ -2,7 +2,7 @@
 #include <vector>
 #include <thread>
 #include <chrono>
-#include <cassert>
+#include "test_assert.hpp"
 #include <numeric>
 #include <algorithm>
 #include <bit>
@@ -19,9 +19,9 @@ void VerifyDeterministicCorrectness() {
     std::cout << "[Part 1] Deterministic Correctness & Bitwise FIFO Verification..." << std::endl;
     
     SpscRingBuffer<BUFFER_CAPACITY> ring;
-    assert(ring.kCapacity == BUFFER_CAPACITY);
-    assert(ring.AvailableRead() == 0);
-    assert(ring.AvailableWrite() == BUFFER_CAPACITY);
+    TEST_ASSERT(ring.kCapacity == BUFFER_CAPACITY);
+    TEST_ASSERT(ring.AvailableRead() == 0);
+    TEST_ASSERT(ring.AvailableWrite() == BUFFER_CAPACITY);
     
     std::vector<float> source_data(TOTAL_SAMPLES);
     for (size_t i = 0; i < TOTAL_SAMPLES; ++i) {
@@ -60,10 +60,10 @@ void VerifyDeterministicCorrectness() {
     consumer.join();
     
     // Strict Assertions: Total count and C++20 bitwise representation equality
-    assert(received_data.size() == TOTAL_SAMPLES);
+    TEST_ASSERT(received_data.size() == TOTAL_SAMPLES);
     for (size_t i = 0; i < TOTAL_SAMPLES; ++i) {
         // True bitwise equality using C++20 std::bit_cast (exact IEEE-754 representation match)
-        assert(std::bit_cast<uint32_t>(received_data[i]) == std::bit_cast<uint32_t>(source_data[i]));
+        TEST_ASSERT(std::bit_cast<uint32_t>(received_data[i]) == std::bit_cast<uint32_t>(source_data[i]));
     }
     
     std::cout << "  [PASS] Verified " << TOTAL_SAMPLES << " samples: True bitwise equality verified via C++20 std::bit_cast<uint32_t> with zero data loss or FIFO reordering." << std::endl;
@@ -174,7 +174,7 @@ void MeasureStatisticalThroughput() {
     std::cout << "                  WASAPI hardware endpoints, neural STT/TTS models, and LLM turnaround)." << std::endl;
     
     // Comparative assertion: In-memory SPSC buffer must operate comfortably within audio budget
-    assert(median_us < 50000 && "Median throughput exceeded real-time audio budget");
+    TEST_ASSERT(median_us < 50000 && "Median throughput exceeded real-time audio budget");
     std::cout << "  [PASS] Microbenchmark throughput comfortably exceeds real-time audio transfer rate." << std::endl;
 }
 

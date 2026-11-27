@@ -1,4 +1,4 @@
-#include <cassert>
+#include "test_assert.hpp"
 #include <chrono>
 #include <cmath>
 #include <iomanip>
@@ -100,8 +100,8 @@ void TestEchoCancellationConvergence() {
         }
     }
 
-    assert(converged_mic_energy > 0.0f);
-    assert(converged_err_energy > 0.0f);
+    TEST_ASSERT(converged_mic_energy > 0.0f);
+    TEST_ASSERT(converged_err_energy > 0.0f);
 
     // Compute empirical ERLE in dB: 10 * log10(E_mic / E_err)
     const float measured_erle = 10.0f * std::log10(converged_mic_energy / converged_err_energy);
@@ -110,9 +110,9 @@ void TestEchoCancellationConvergence() {
               << " dB, Initial Mic Energy: " << initial_mic_energy << ")" << std::endl;
 
     // Requirement: Attenuation >= 12 dB
-    assert(measured_erle >= 12.0f);
+    TEST_ASSERT(measured_erle >= 12.0f);
     // DTD must not trigger false positive on pure echo
-    assert(!aec.IsDoubleTalk());
+    TEST_ASSERT(!aec.IsDoubleTalk());
 }
 
 void TestDoubleTalkAndBargeInPreservation() {
@@ -173,9 +173,9 @@ void TestDoubleTalkAndBargeInPreservation() {
               << " | Output Energy: " << output_energy << std::endl;
 
     // Requirement: DTD must identify double-talk
-    assert(dtd_triggered);
+    TEST_ASSERT(dtd_triggered);
     // Requirement: Near-end human voice must NOT be suppressed (output retains at least 50% energy)
-    assert(output_energy >= 0.50f * voice_energy);
+    TEST_ASSERT(output_energy >= 0.50f * voice_energy);
 
     // 3. Verify filter weights did not diverge or produce NaN
     for (size_t f = 0; f < 10; ++f) {
@@ -184,8 +184,8 @@ void TestDoubleTalkAndBargeInPreservation() {
         float test_out[160]{0.0f};
         aec.ProcessFrame(test_mic, test_ref, test_out, true);
         for (int i = 0; i < 160; ++i) {
-            assert(!std::isnan(test_out[i]));
-            assert(!std::isinf(test_out[i]));
+            TEST_ASSERT(!std::isnan(test_out[i]));
+            TEST_ASSERT(!std::isinf(test_out[i]));
         }
     }
 }
@@ -204,9 +204,9 @@ void TestStopPlaybackLatencyAndTiming() {
     std::cout << "  [Latency] StopPlayback() elapsed: " << stop_duration_ms << " ms" << std::endl;
 
     // Requirement: StopPlayback() must complete in strictly under 20 ms
-    assert(stop_duration_ms < 20.0);
-    assert(!tts.IsSpeaking());
-    assert(tts.FarEndReferenceBuffer().AvailableRead() == 0);
+    TEST_ASSERT(stop_duration_ms < 20.0);
+    TEST_ASSERT(!tts.IsSpeaking());
+    TEST_ASSERT(tts.FarEndReferenceBuffer().AvailableRead() == 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -267,15 +267,15 @@ void TestMultiDelayAutoCalibration() {
                   << " samples, NCC=" << estimator.LastCorrelationPeak() << ")" << std::endl;
 
         // 1. Assert estimator locked
-        assert(locked_seen);
-        assert(estimator.IsDelayLocked());
+        TEST_ASSERT(locked_seen);
+        TEST_ASSERT(estimator.IsDelayLocked());
 
         // 2. Assert estimated delay is within +/- 4 ms of ground truth
         const float delay_err = std::abs(estimator.EstimatedDelayMs() - c.delay_ms);
-        assert(delay_err <= 4.0f);
+        TEST_ASSERT(delay_err <= 4.0f);
 
         // 3. Assert causal safety lead: bulk delay must be <= estimated lag
-        assert(estimator.LockedBulkDelaySamples() <= c.delay_samples);
+        TEST_ASSERT(estimator.LockedBulkDelaySamples() <= c.delay_samples);
 
         // 4. Measure converged ERLE over frames 140 to 195
         float converged_mic = 0.0f;
@@ -287,12 +287,12 @@ void TestMultiDelayAutoCalibration() {
                 converged_err += clean[offset + i] * clean[offset + i];
             }
         }
-        assert(converged_mic > 0.0f);
-        assert(converged_err > 0.0f);
+        TEST_ASSERT(converged_mic > 0.0f);
+        TEST_ASSERT(converged_err > 0.0f);
 
         const float measured_erle = 10.0f * std::log10(converged_mic / converged_err);
         std::cout << "    -> Converged ERLE: " << measured_erle << " dB" << std::endl;
-        assert(measured_erle >= 12.0f);
+        TEST_ASSERT(measured_erle >= 12.0f);
     }
 }
 
@@ -317,7 +317,7 @@ void TestDoubleTalkProtectionDuringCalibration() {
         }
     }
 
-    assert(estimator.IsDelayLocked());
+    TEST_ASSERT(estimator.IsDelayLocked());
     const size_t locked_bulk_before = estimator.LockedBulkDelaySamples();
     const float estimated_ms_before = estimator.EstimatedDelayMs();
 
@@ -343,8 +343,8 @@ void TestDoubleTalkProtectionDuringCalibration() {
               << " | Estimated ms: " << estimator.EstimatedDelayMs() << std::endl;
 
     // Assert that double-talk did NOT alter or corrupt the locked bulk delay!
-    assert(estimator.LockedBulkDelaySamples() == locked_bulk_before);
-    assert(estimator.EstimatedDelayMs() == estimated_ms_before);
+    TEST_ASSERT(estimator.LockedBulkDelaySamples() == locked_bulk_before);
+    TEST_ASSERT(estimator.EstimatedDelayMs() == estimated_ms_before);
 }
 
 void TestDeviceHotSwapRecalibration() {
@@ -368,14 +368,14 @@ void TestDeviceHotSwapRecalibration() {
         }
     }
 
-    assert(estimator.IsDelayLocked());
-    assert(std::abs(estimator.EstimatedDelayMs() - 20.0f) <= 4.0f);
+    TEST_ASSERT(estimator.IsDelayLocked());
+    TEST_ASSERT(std::abs(estimator.EstimatedDelayMs() - 20.0f) <= 4.0f);
     std::cout << "  [HotSwap Phase 1] Locked at: " << estimator.EstimatedDelayMs() << " ms" << std::endl;
 
     // 2. Simulate audio device hot-swap / discontinuity (e.g. switching to USB headset / virtual mixer)
     estimator.Reset();
     aec.Reset();
-    assert(!estimator.IsDelayLocked());
+    TEST_ASSERT(!estimator.IsDelayLocked());
 
     // 3. New device presents 95 ms delay (1,520 samples)
     constexpr size_t kPhase2Frames = 150;
@@ -399,9 +399,9 @@ void TestDeviceHotSwapRecalibration() {
     std::cout << "  [HotSwap Phase 2] Relocked: " << (relocked ? "YES" : "NO")
               << " at: " << estimator.EstimatedDelayMs() << " ms" << std::endl;
 
-    assert(relocked);
-    assert(estimator.IsDelayLocked());
-    assert(std::abs(estimator.EstimatedDelayMs() - 95.0f) <= 4.0f);
+    TEST_ASSERT(relocked);
+    TEST_ASSERT(estimator.IsDelayLocked());
+    TEST_ASSERT(std::abs(estimator.EstimatedDelayMs() - 95.0f) <= 4.0f);
 
     // Verify converged ERLE after relock
     float conv_mic = 0.0f;
@@ -415,7 +415,7 @@ void TestDeviceHotSwapRecalibration() {
     }
     const float erle = 10.0f * std::log10(conv_mic / conv_err);
     std::cout << "    -> Converged ERLE after hot-swap: " << erle << " dB" << std::endl;
-    assert(erle >= 12.0f);
+    TEST_ASSERT(erle >= 12.0f);
 }
 
 void TestCombinedCpuBudget() {
@@ -440,7 +440,7 @@ void TestCombinedCpuBudget() {
               << " ms (Average: " << avg_per_frame_ms << " ms per 10 ms frame)" << std::endl;
 
     // Requirement: Combined runtime must be < 0.5 ms per 10 ms frame (> 20x faster than real-time)
-    assert(avg_per_frame_ms < 0.50);
+    TEST_ASSERT(avg_per_frame_ms < 0.50);
 }
 
 int main() {

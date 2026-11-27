@@ -1,6 +1,6 @@
 #include "ipc/frame_codec.hpp"
 
-#include <cassert>
+#include "test_assert.hpp"
 #include <iostream>
 #include <vector>
 
@@ -9,21 +9,21 @@ void TestEncodeDecodeRoundTrip() {
     const uint32_t turn_id = 42;
 
     auto frame = jarvis::ipc::EncodeFrame(jarvis::ipc::kMsgTypeControlJson, payload, turn_id);
-    assert(frame.size() == jarvis::ipc::kHeaderSize + payload.size());
+    TEST_ASSERT(frame.size() == jarvis::ipc::kHeaderSize + payload.size());
 
     // Verify magic bytes
-    assert(frame[0] == 'J' && frame[1] == 'R' && frame[2] == 'V' && frame[3] == 'S');
+    TEST_ASSERT(frame[0] == 'J' && frame[1] == 'R' && frame[2] == 'V' && frame[3] == 'S');
 
     jarvis::ipc::Header hdr{};
     bool ok = jarvis::ipc::DecodeHeader(frame.data(), frame.size(), hdr);
-    assert(ok);
-    assert(hdr.version == jarvis::ipc::kProtocolVersion);
-    assert(hdr.msg_type == jarvis::ipc::kMsgTypeControlJson);
-    assert(hdr.turn_id == turn_id);
-    assert(hdr.payload_len == payload.size());
+    TEST_ASSERT(ok);
+    TEST_ASSERT(hdr.version == jarvis::ipc::kProtocolVersion);
+    TEST_ASSERT(hdr.msg_type == jarvis::ipc::kMsgTypeControlJson);
+    TEST_ASSERT(hdr.turn_id == turn_id);
+    TEST_ASSERT(hdr.payload_len == payload.size());
 
     std::string recovered_payload(reinterpret_cast<const char*>(frame.data() + jarvis::ipc::kHeaderSize), hdr.payload_len);
-    assert(recovered_payload == payload);
+    TEST_ASSERT(recovered_payload == payload);
 
     std::cout << "[PASS] TestEncodeDecodeRoundTrip" << std::endl;
 }
@@ -31,8 +31,8 @@ void TestEncodeDecodeRoundTrip() {
 void TestDecodeHeaderTruncated() {
     uint8_t short_buf[10]{'J', 'R', 'V', 'S'};
     jarvis::ipc::Header hdr{};
-    assert(!jarvis::ipc::DecodeHeader(short_buf, 10, hdr));
-    assert(!jarvis::ipc::DecodeHeader(nullptr, 16, hdr));
+    TEST_ASSERT(!jarvis::ipc::DecodeHeader(short_buf, 10, hdr));
+    TEST_ASSERT(!jarvis::ipc::DecodeHeader(nullptr, 16, hdr));
 
     std::cout << "[PASS] TestDecodeHeaderTruncated" << std::endl;
 }
@@ -42,7 +42,7 @@ void TestDecodeHeaderBadMagic() {
     frame[0] = 'X'; // Corrupt magic
 
     jarvis::ipc::Header hdr{};
-    assert(!jarvis::ipc::DecodeHeader(frame.data(), frame.size(), hdr));
+    TEST_ASSERT(!jarvis::ipc::DecodeHeader(frame.data(), frame.size(), hdr));
 
     std::cout << "[PASS] TestDecodeHeaderBadMagic" << std::endl;
 }
@@ -52,7 +52,7 @@ void TestDecodeHeaderWrongVersion() {
     frame[4] = 3; // Corrupt version
 
     jarvis::ipc::Header hdr{};
-    assert(!jarvis::ipc::DecodeHeader(frame.data(), frame.size(), hdr));
+    TEST_ASSERT(!jarvis::ipc::DecodeHeader(frame.data(), frame.size(), hdr));
 
     std::cout << "[PASS] TestDecodeHeaderWrongVersion" << std::endl;
 }
@@ -62,7 +62,7 @@ void TestDecodeHeaderUnknownMsgType() {
     frame[6] = 0xFF; // Unknown msg type 0x00FF
 
     jarvis::ipc::Header hdr{};
-    assert(!jarvis::ipc::DecodeHeader(frame.data(), frame.size(), hdr));
+    TEST_ASSERT(!jarvis::ipc::DecodeHeader(frame.data(), frame.size(), hdr));
 
     std::cout << "[PASS] TestDecodeHeaderUnknownMsgType" << std::endl;
 }
@@ -81,7 +81,7 @@ void TestDecodeHeaderOversizedJson() {
     std::memcpy(buf + 12, &oversized_len, 4);
 
     jarvis::ipc::Header hdr{};
-    assert(!jarvis::ipc::DecodeHeader(buf, sizeof(buf), hdr));
+    TEST_ASSERT(!jarvis::ipc::DecodeHeader(buf, sizeof(buf), hdr));
 
     std::cout << "[PASS] TestDecodeHeaderOversizedJson" << std::endl;
 }
@@ -100,7 +100,7 @@ void TestDecodeHeaderOversizedPcm() {
     std::memcpy(buf + 12, &oversized_len, 4);
 
     jarvis::ipc::Header hdr{};
-    assert(!jarvis::ipc::DecodeHeader(buf, sizeof(buf), hdr));
+    TEST_ASSERT(!jarvis::ipc::DecodeHeader(buf, sizeof(buf), hdr));
 
     std::cout << "[PASS] TestDecodeHeaderOversizedPcm" << std::endl;
 }
@@ -120,7 +120,7 @@ void TestDecodeHeaderMaxU32NoOom() {
 
     jarvis::ipc::Header hdr{};
     // Verification: Must reject without attempting allocation
-    assert(!jarvis::ipc::DecodeHeader(buf, sizeof(buf), hdr));
+    TEST_ASSERT(!jarvis::ipc::DecodeHeader(buf, sizeof(buf), hdr));
 
     std::cout << "[PASS] TestDecodeHeaderMaxU32NoOom" << std::endl;
 }
@@ -133,7 +133,7 @@ void TestEncodeThrowsOnOversizedPayload() {
     } catch (const std::length_error&) {
         threw = true;
     }
-    assert(threw);
+    TEST_ASSERT(threw);
 
     std::cout << "[PASS] TestEncodeThrowsOnOversizedPayload" << std::endl;
 }
@@ -145,7 +145,7 @@ void TestEncodeThrowsOnUnknownMsgType() {
     } catch (const std::invalid_argument&) {
         threw = true;
     }
-    assert(threw);
+    TEST_ASSERT(threw);
 
     std::cout << "[PASS] TestEncodeThrowsOnUnknownMsgType" << std::endl;
 }

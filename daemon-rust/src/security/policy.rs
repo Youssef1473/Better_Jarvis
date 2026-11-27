@@ -276,6 +276,7 @@ pub fn is_secret_path(raw_path: &Path, resolved_path: Option<&str>) -> bool {
     false
 }
 
+#[derive(Debug, Clone)]
 pub struct PolicyEngine {
     #[allow(dead_code)]
     allowed_directories: Vec<PathBuf>,
@@ -604,6 +605,11 @@ impl PolicyEngine {
             {
                 return ActionPolicy::red("Access to private credentials or secrets in arguments is forbidden");
             }
+        }
+
+        // Align argument-injection / LOLBin checks with sandbox::validate_binary_arguments
+        if let Err(err) = crate::security::sandbox::validate_binary_arguments(base_prog, args) {
+            return ActionPolicy::red(err.to_string());
         }
 
         match base_prog {
@@ -944,6 +950,9 @@ mod tests {
         assert_eq!(policy.evaluate_command("cat ~/.ssh/id_rsa").tier, SecurityTier::Red);
         assert_eq!(policy.evaluate_command("reg delete HKLM\\Software").tier, SecurityTier::Red);
         assert_eq!(policy.evaluate_command("git -c core.sshCommand=evil status").tier, SecurityTier::Red);
+        assert_eq!(policy.evaluate_command("rg --pre=calc foo").tier, SecurityTier::Red);
+        assert_eq!(policy.evaluate_command("fd -x calc").tier, SecurityTier::Red);
+        assert_eq!(policy.evaluate_command("cmake -P evil.cmake").tier, SecurityTier::Red);
         assert_eq!(policy.evaluate_command("git | whoami").tier, SecurityTier::Red);
         assert_eq!(policy.evaluate_command("git & calc.exe").tier, SecurityTier::Red);
     }
